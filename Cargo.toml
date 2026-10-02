@@ -1,0 +1,18 @@
+[package]
+name = "jj-fork"
+version = "0.1.0"
+edition = "2024"
+description = "Maintain a fork as jj series and glues on top of upstream, and keep them current"
+license = "MIT"
+repository = "https://github.com/ajac-zero/jj-fork"
+readme = "README.md"
+keywords = ["jj", "jujutsu", "fork", "git", "vcs"]
+categories = ["command-line-utilities", "development-tools"]
+
+[dependencies]
+anyhow = "1.0.104"
+clap = { version = "4.6.7", features = ["derive"] }
+globset = "0.4.20"
+serde = { version = "1.0.229", features = ["derive"] }
+tempfile = "3.27.0"
+toml = "1.1.6"

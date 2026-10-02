@@ -1,0 +1,40 @@
+# .jj-fork.toml for a fork of github.com/envoyproxy/ai-gateway (Go).
+
+[upstream]
+url = "https://github.com/envoyproxy/ai-gateway.git"
+
+[fork]
+mirror_branch = "main"
+series_prefixes = ["patch/", "tooling/"]
+
+[checks]
+patch = [
+  { name = "build", run = "go build ./...", tier = "medium", low_if_errors_at_most = 2 },
+  { name = "vet", run = "go vet {go_packages}", when = "go_packages", tier = "medium", low_if_errors_at_most = 2 },
+  { name = "test", run = "go test -count=1 {go_packages}", when = "go_packages", kind = "go-test", tier = "high" },
+]
+fork = [
+  { name = "build", run = "go build ./..." },
+  { name = "vet", run = "go vet ./..." },
+  { name = "lint", run = "go tool -modfile=tools/go.mod golangci-lint run --concurrency={jobs} --build-tags=test_crdcel,test_controller,test_extproc,test_e2e ./..." },
+  { name = "test", run = "go test $(go list ./... | grep -v -E 'tests/controller|tests/crdcel|/tests/e2e|tests/data-plane')", kind = "go-test" },
+]
+
+[generated]
+paths = [
+  "api/*/zz_generated.deepcopy.go",
+  "manifests/charts/ai-gateway-crds-helm/templates/*",
+  "site/docs/api/api.mdx",
+]
+inputs = ["api/**"]
+regenerate = "make apigen apidoc"
+
+[generated.header]
+text = """Copyright Envoy AI Gateway Authors
+SPDX-License-Identifier: Apache-2.0
+The full text of the Apache license is available in the LICENSE file at
+the root of the repo."""
+comments = { go = "//", yaml = "#" }
+
+[low_memory]
+env = { GOFLAGS = "-p={jobs}", GOGC = "50", GOMEMLIMIT = "{memory_limit_mib}MiB" }
