@@ -286,4 +286,105 @@ git -C "$fk" rev-parse -q --verify tooling/newlocal >/dev/null || fail "new loca
 git -C "$fk" cat-file -e fork/main:newlocal.txt || fail "new local series not merged"
 ok "new and ahead local series are kept and pushed"
 
+# Scenario 7: a stale clone must not drop series it does not know about. Someone else pushes
+
+# Scenario 7: a stale clone must not drop series it does not know about. Someone else pushes
+# patch/theirs. jj-fork normally tracks it before assembling; when this clone cannot (simulated
+# by a jj wrapper that fails `bookmark track`), the remote series is untracked and has no local
+# bookmark, so assemble and assemble --push refuse and name it. Deleting a series on purpose
+# in this clone still works.
+git clone -q "$root/fork.git" "$root/stale"
+cd "$root/stale"
+git checkout -q fork/main
+expect_code 0 "$bin" --config "$root/config.toml" init
+expect_code 0 "$bin" --config "$root/config.toml" assemble --push
+git -C "$root/editor" fetch -q origin
+git -C "$root/editor" checkout -q -B patch/theirs origin/main
+printf 'theirs\n' >"$root/editor/theirs.txt"
+git -C "$root/editor" add -A && git -C "$root/editor" commit -qm "patch theirs"
+git -C "$root/editor" push -q origin patch/theirs
+before="$(git -C "$root/fork.git" for-each-ref)"
+git fetch -q origin
+jj bookmark delete --quiet patch/theirs 2>/dev/null || true
+jj bookmark untrack --quiet patch/theirs --remote origin
+mkdir "$root/nobin"
+printf '#!/usr/bin/env bash\n[[ "${1:-}" == bookmark && "${2:-}" == track ]] && exit 1\nexec %s "$@"\n' "$(command -v jj)" >"$root/nobin/jj"
+chmod +x "$root/nobin/jj"
+untracking="env PATH=$root/nobin:$PATH"
+expect_code 20 $untracking "$bin" --config "$root/config.toml" assemble --no-fetch --no-checks --push
+contains "$out" "nothing pushed"
+contains "$out" "  patch/theirs"
+[[ "$(git -C "$root/fork.git" for-each-ref)" == "$before" ]] || fail "refused push still changed the remote"
+jj new --quiet "main@upstream" -m "tooling: stale local"
+printf 'stale\n' >stale.txt
+jj bookmark create --quiet tooling/stale -r @
+expect_code 20 $untracking "$bin" --config "$root/config.toml" assemble --no-fetch --no-checks
+contains "$out" "fork/main not moved"
+contains "$out" "  patch/theirs"
+jj bookmark forget --quiet tooling/stale
+ok "assemble and assemble --push refuse a remote series that is neither merged nor deleted, and name it"
+
+expect_code 0 "$bin" --config "$root/config.toml" assemble --no-fetch --push
+git -C "$root/fork.git" cat-file -e fork/main:theirs.txt || fail "tracked series not merged"
+jj bookmark delete --quiet patch/theirs
+expect_code 0 "$bin" --config "$root/config.toml" assemble --no-fetch --push
+[[ -z "$(jj bookmark list --color=never patch/theirs -T 'if(!remote && present, name)')" ]] || fail "deleted series came back locally"
+git -C "$root/fork.git" cat-file -e fork/main:theirs.txt 2>/dev/null && fail "deleted series still merged"
+ok "deleting a series locally still works"
+
+# Scenario 8: a failing go test is retried up to 3 times (any pass is flaky and does not block),
+# then run 5 times on bare upstream: it blocks only if every retry fails and all 5 upstream runs
+# pass. A fake `go` makes this deterministic: the full run always fails TestFlaky, retries in the
+# candidate pass on the FAKE_PASS_ON-th try (never when unset), and the baseline worktree's
+# `-count=5` run passes or fails per FAKE_UPSTREAM. FAKE_COUNTER counts the retries.
+git clone -q "$root/fork.git" "$root/gotest"
+cd "$root/gotest"
+git checkout -q fork/main
+expect_code 0 "$bin" --config "$root/config.toml" init
+expect_code 0 "$bin" --config "$root/config.toml" assemble --push
+jj new --quiet "main@upstream" -m "tooling: go"
+printf 'go\n' >go.txt
+jj bookmark create --quiet tooling/go -r @
+mkdir "$root/gobin"
+cat >"$root/gobin/go" <<'GO'
+#!/usr/bin/env bash
+if [[ "$*" != *" -run "* ]]; then
+  printf -- '--- FAIL: TestFlaky (0.00s)\nFAIL\nFAIL\texample.com/m\t0.1s\n'
+  exit 1
+fi
+if [[ "$PWD" == */baseline ]]; then
+  [[ "$*" == *"-count=5 -run ^TestFlaky\$ example.com/m"* ]] || exit 3
+  [[ "${FAKE_UPSTREAM:-}" == pass ]]
+  exit
+fi
+n=$(($(cat "$FAKE_COUNTER" 2>/dev/null || echo 0) + 1))
+echo "$n" >"$FAKE_COUNTER"
+[[ -n "${FAKE_PASS_ON:-}" && $n -ge $FAKE_PASS_ON ]]
+GO
+chmod +x "$root/gobin/go"
+sed 's|^fork = \[|&\n  { name = "go", run = "go test ./...", kind = "go-test" },|' "$root/config.toml" >"$root/config-go.toml"
+grep -qF 'kind = "go-test"' "$root/config-go.toml" || fail "go-test check not added"
+export FAKE_COUNTER="$root/go-counter"
+go_assemble() { # go_assemble CODE; env FAKE_* set by the caller
+  rm -f "$FAKE_COUNTER"; rm -rf "$root/tmp"; mkdir "$root/tmp"
+  expect_code "$1" env TMPDIR="$root/tmp" PATH="$root/gobin:$PATH" "$bin" --config "$root/config-go.toml" assemble --no-fetch
+  golog="$(cat "$root"/tmp/jj-fork-logs/*/fork-branch.log)"
+}
+
+FAKE_PASS_ON= FAKE_UPSTREAM=pass go_assemble 20
+[[ "$(cat "$FAKE_COUNTER")" == 3 ]] || fail "expected exactly 3 retries"
+contains "$golog" "fails every retry here but passes 5 runs on upstream"
+contains "$out" "fails go checks"
+ok "a go test that fails every retry and passes upstream blocks"
+
+FAKE_PASS_ON= FAKE_UPSTREAM=fail go_assemble 0
+contains "$golog" "example.com/m TestFlaky also fails on upstream; ignoring"
+contains "$out" "note: also fails on upstream, ignored: example.com/m TestFlaky"
+ok "a go test that also fails on upstream is ignored"
+
+FAKE_PASS_ON=2 FAKE_UPSTREAM=pass go_assemble 0
+[[ "$(cat "$FAKE_COUNTER")" == 2 ]] || fail "retrying should stop at the first pass"
+contains "$golog" "note: flaky: example.com/m TestFlaky failed, then passed on retry"
+ok "a go test that passes on a retry is flaky and does not block"
+
 echo "all $pass scenarios passed"

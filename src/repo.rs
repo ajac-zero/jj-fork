@@ -90,6 +90,39 @@ impl Repo {
         Ok(names)
     }
 
+    /// Names under `prefixes` deliberately deleted in this clone: the bookmark is tracked on
+    /// `remote` but absent locally, so the deletion waits to be pushed. A remote bookmark that is
+    /// untracked, or that jj does not know at all, is not in this set.
+    pub fn deleted_locally(&self, remote: &str, prefixes: &[String]) -> Result<Vec<String>> {
+        let mut args = vec![
+            "bookmark".to_string(),
+            "list".into(),
+            "--color=never".into(),
+            "--all-remotes".into(),
+        ];
+        args.extend(prefixes.iter().map(|p| format!("glob:{p}*")));
+        args.extend([
+            "-T".into(),
+            r#"name ++ "\t" ++ if(remote, remote, "") ++ "\t" ++ present ++ "\t" ++ tracked ++ "\n""#.into(),
+        ]);
+        let args: Vec<&str> = args.iter().map(String::as_str).collect();
+        let out = self.jj(&args)?;
+        let mut local = std::collections::BTreeSet::new();
+        let mut tracked = std::collections::BTreeSet::new();
+        for line in out.lines() {
+            let f: Vec<&str> = line.split('\t').collect();
+            if f.len() != 4 {
+                continue;
+            }
+            if f[1].is_empty() && f[2] == "true" {
+                local.insert(f[0].to_string());
+            } else if f[1] == remote && f[2] == "true" && f[3] == "true" {
+                tracked.insert(f[0].to_string());
+            }
+        }
+        Ok(tracked.difference(&local).cloned().collect())
+    }
+
     /// Remote-tracking refs of `remote` as `name commit` lines, for detecting concurrent pushes.
     pub fn remote_refs(&self, remote: &str) -> Result<Vec<String>> {
         let out = self.git(&[

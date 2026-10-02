@@ -118,8 +118,9 @@ impl<'a> Checker<'a> {
         Ok(Outcome::Pass)
     }
 
-    /// Runs a go-test check. A failing test is retried once, then run on upstream at the
-    /// target; tests that fail there too are recorded and ignored.
+    /// Runs a go-test check. A failing test is retried up to RETRIES times (any pass is
+    /// flaky), then run UPSTREAM_RUNS times on upstream at the target; tests that fail there are
+    /// recorded and ignored.
     fn go_test(&mut self, dir: &Path, command: &str, log: &Path) -> Result<bool> {
         let attempt = self.scratch.join("go-test.log");
         let _ = std::fs::remove_file(&attempt);
@@ -142,38 +143,48 @@ impl<'a> Checker<'a> {
                 real = true;
                 continue;
             };
-            let retry = format!("go test -count=1 -run '^{test}$' {}", failure.package);
+            let env = self.env.clone();
             let scratch_log = self.scratch.join("retry.log");
-            if run::shell(dir, &retry, &self.env, &scratch_log)? {
-                append(
+            let rerun = |dir: &Path, count: usize| {
+                let command = format!("go test -count={count} -run '^{test}$' {}", failure.package);
+                run::shell(dir, &command, &env, &scratch_log)
+            };
+            let verdict = classify_failure(
+                || rerun(dir, 1),
+                || {
+                    let baseline = self.baseline()?;
+                    rerun(&baseline, UPSTREAM_RUNS)
+                },
+            )?;
+            match verdict {
+                Verdict::Flaky => append(
                     log,
                     &format!(
-                        "jj-fork: note: {} {test} failed once, then passed on retry\n",
+                        "jj-fork: note: flaky: {} {test} failed, then passed on retry\n",
                         failure.package
                     ),
-                )?;
-                continue;
-            }
-            let baseline = self.baseline()?;
-            if run::shell(&baseline, &retry, &self.env, &scratch_log)? {
-                append(
-                    log,
-                    &format!(
-                        "jj-fork: {} {test} fails here but passes on upstream\n",
-                        failure.package
-                    ),
-                )?;
-                real = true;
-            } else {
-                append(
-                    log,
-                    &format!(
-                        "jj-fork: note: {} {test} also fails on upstream; ignoring\n",
-                        failure.package
-                    ),
-                )?;
-                self.upstream_failures
-                    .insert(format!("{} {test}", failure.package));
+                )?,
+                Verdict::UpstreamFailure => {
+                    append(
+                        log,
+                        &format!(
+                            "jj-fork: note: {} {test} also fails on upstream; ignoring\n",
+                            failure.package
+                        ),
+                    )?;
+                    self.upstream_failures
+                        .insert(format!("{} {test}", failure.package));
+                }
+                Verdict::Real => {
+                    append(
+                        log,
+                        &format!(
+                            "jj-fork: {} {test} fails every retry here but passes {UPSTREAM_RUNS} runs on upstream\n",
+                            failure.package
+                        ),
+                    )?;
+                    real = true;
+                }
             }
         }
         Ok(!real)
@@ -188,6 +199,39 @@ impl<'a> Checker<'a> {
         }
         Ok(self.baseline.as_ref().unwrap().path.clone())
     }
+}
+
+/// Retries of a failing go test before it is run on upstream.
+const RETRIES: usize = 3;
+/// Runs of a failing go test on bare upstream; one failure means upstream is flaky or broken.
+const UPSTREAM_RUNS: usize = 5;
+
+#[derive(Debug, PartialEq, Eq)]
+enum Verdict {
+    /// Failed, then passed on a retry: not blocking.
+    Flaky,
+    /// Failed every retry, and fails on upstream too: ignored.
+    UpstreamFailure,
+    /// Failed every retry and passed every upstream run: caused by the change.
+    Real,
+}
+
+/// Classifies a failed test. `retry` reruns it here and says whether it passed; `upstream` runs
+/// it UPSTREAM_RUNS times on upstream and says whether all runs passed.
+fn classify_failure(
+    mut retry: impl FnMut() -> Result<bool>,
+    upstream: impl FnOnce() -> Result<bool>,
+) -> Result<Verdict> {
+    for _ in 0..RETRIES {
+        if retry()? {
+            return Ok(Verdict::Flaky);
+        }
+    }
+    Ok(if upstream()? {
+        Verdict::Real
+    } else {
+        Verdict::UpstreamFailure
+    })
 }
 
 /// Lowers parallelism and sets the configured environment on machines with little memory.
@@ -434,6 +478,40 @@ FAIL\texample.com/m/c [build failed]
                     test: None
                 },
             ]
+        );
+    }
+
+    #[test]
+    fn a_retry_that_passes_is_flaky_and_skips_upstream() {
+        let mut runs = 0;
+        let verdict = classify_failure(
+            || {
+                runs += 1;
+                Ok(runs == 3)
+            },
+            || panic!("upstream must not run"),
+        )
+        .unwrap();
+        assert_eq!(verdict, Verdict::Flaky);
+        assert_eq!(runs, 3);
+    }
+
+    #[test]
+    fn failing_every_retry_then_upstream_decides() {
+        let mut runs = 0;
+        let verdict = classify_failure(
+            || {
+                runs += 1;
+                Ok(false)
+            },
+            || Ok(false),
+        )
+        .unwrap();
+        assert_eq!(verdict, Verdict::UpstreamFailure);
+        assert_eq!(runs, RETRIES);
+        assert_eq!(
+            classify_failure(|| Ok(false), || Ok(true)).unwrap(),
+            Verdict::Real
         );
     }
 

@@ -669,6 +669,12 @@ impl<'a> Session<'a> {
                 return Ok(Assembled::Failed);
             }
         }
+        if !self.nothing_dropped(&merge)? {
+            if self.options.candidate.is_none() {
+                repo.op_restore(&op)?;
+            }
+            return Ok(Assembled::Failed);
+        }
         repo.jj(&[
             "bookmark",
             "set",
@@ -700,6 +706,11 @@ impl<'a> Session<'a> {
                 report(&format!("  {name}"));
             }
             report("rerun: jj fork assemble --push");
+            return Ok(EXIT_NEEDS_AGENT);
+        }
+        let branch = Repo::bookmark_revset(&self.config.fork.branch);
+        if !self.nothing_dropped(&self.repo.rev(&branch)?)? {
+            report("nothing pushed");
             return Ok(EXIT_NEEDS_AGENT);
         }
         let mut bookmarks = vec![self.config.fork.branch.clone()];
@@ -748,6 +759,55 @@ impl<'a> Session<'a> {
         Ok(EXIT_OK)
     }
 
+    /// Refuses (and reports) when a series or glue on the fork remote is neither merged into
+    /// `merge` nor deliberately deleted in this clone: publishing the fork branch would silently
+    /// drop it.
+    fn nothing_dropped(&self, merge: &str) -> Result<bool> {
+        let fork = &self.config.fork;
+        let mut prefixes = fork.series_prefixes.clone();
+        prefixes.push(fork.glue_prefix.clone());
+        let deleted: std::collections::BTreeSet<String> = self
+            .repo
+            .deleted_locally(&fork.remote, &prefixes)?
+            .into_iter()
+            .collect();
+        let remote: Vec<(String, String)> = fork_refs(self.repo, self.config)?
+            .into_iter()
+            .filter_map(|l| {
+                l.split_once(' ')
+                    .map(|(n, c)| (n.to_string(), c.to_string()))
+            })
+            .filter(|(n, _)| prefixes.iter().any(|p| n.starts_with(p.as_str())))
+            .collect();
+        let dropped = dropped_bookmarks(
+            &remote,
+            |name| deleted.contains(name),
+            |name, commit| {
+                // A local bookmark is what gets pushed, so it is what must be merged; the
+                // remote's commit only counts for a bookmark this clone has no local copy of.
+                let tip = self
+                    .repo
+                    .rev(&Repo::bookmark_revset(name))
+                    .unwrap_or_else(|_| commit.to_string());
+                self.repo.is_ancestor(&tip, merge).unwrap_or(false)
+            },
+        );
+        if dropped.is_empty() {
+            return Ok(true);
+        }
+        report(&format!(
+            "{} not moved: these bookmarks on {} are neither merged into it nor deleted here:",
+            fork.branch, fork.remote
+        ));
+        for name in &dropped {
+            report(&format!("  {name}"));
+        }
+        report(
+            "fetch and track them (jj bookmark track <name> --remote <remote>), or delete one deliberately: jj bookmark delete <name>",
+        );
+        Ok(false)
+    }
+
     pub fn finish(&self) {
         for failure in &self.checker.upstream_failures {
             report(&format!("note: also fails on upstream, ignored: {failure}"));
@@ -771,6 +831,22 @@ fn fork_refs(repo: &Repo, config: &Config) -> Result<Vec<String>> {
                     .any(|p| name.starts_with(p.as_str()))
         })
         .collect())
+}
+
+/// Remote `(name, commit)` bookmarks that would be lost: not an ancestor of the new fork branch
+/// (`merged(name, commit)`) and not deliberately deleted here (`deleted(name)`).
+fn dropped_bookmarks(
+    remote: &[(String, String)],
+    deleted: impl Fn(&str) -> bool,
+    merged: impl Fn(&str, &str) -> bool,
+) -> Vec<String> {
+    let mut names: Vec<String> = remote
+        .iter()
+        .filter(|(name, commit)| !deleted(name) && !merged(name, commit))
+        .map(|(name, _)| name.clone())
+        .collect();
+    names.sort();
+    names
 }
 
 /// Names whose commit differs between two `name commit` snapshots.
@@ -878,6 +954,23 @@ mod tests {
     fn conflict_size_counts_both_sides_and_ignores_markers() {
         let text = "a\n<<<<<<< HEAD\nours1\nours2\n||||||| base\nbase\n=======\ntheirs\n>>>>>>> abc\nb\n<<<<<<< HEAD\nx\n=======\n>>>>>>> def\n";
         assert_eq!(conflict_size(text), (2, 5));
+    }
+
+    #[test]
+    fn dropped_bookmarks_need_a_merge_or_a_deliberate_deletion() {
+        let remote: Vec<(String, String)> = [
+            ("patch/merged", "c1"),
+            ("patch/deleted", "c2"),
+            ("patch/untracked", "c3"),
+            ("glue/new", "c4"),
+        ]
+        .iter()
+        .map(|(n, c)| (n.to_string(), c.to_string()))
+        .collect();
+        let dropped = dropped_bookmarks(&remote, |n| n == "patch/deleted", |_, c| c == "c1");
+        assert_eq!(dropped, vec!["glue/new", "patch/untracked"]);
+        assert!(dropped_bookmarks(&remote, |_| true, |_, _| true).is_empty());
+        assert!(dropped_bookmarks(&[], |_| false, |_, _| false).is_empty());
     }
 
     #[test]
