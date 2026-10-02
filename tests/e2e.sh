@@ -151,11 +151,17 @@ contains "$out" "(restacked)"
 git -C "$root/fork.git" cat-file -e fork/main:zx-extra.txt || fail "moved series not in fork/main"
 ok "a stale glue is restacked onto the moved series"
 
-# A series inside another series is a stale bookmark; assemble refuses.
-jj bookmark create --quiet patch/inner -r 'bookmarks(exact:"patch/zx")-'
+# A series inside another series is a stale bookmark; assemble refuses. (Unpublished commits, so
+# reconcile does not mistake it for a series deleted after being published.)
+zx_tip="$(jj log --no-graph -r 'bookmarks(exact:"patch/zx")' -T commit_id)"
+jj new --quiet "$zx_tip" -m "patch x: unpublished 1"
+jj new --quiet -m "patch x: unpublished 2"
+jj bookmark create --quiet patch/inner -r @-
+jj bookmark set --quiet patch/zx -r @
 expect_code 20 "$bin" --config "$root/config.toml" assemble
 contains "$out" "patch/inner is contained in patch/zx"
 jj bookmark forget --quiet patch/inner
+jj bookmark set --quiet patch/zx -r "$zx_tip" --allow-backwards
 ok "a nested series is rejected"
 
 # Scenario 4: a shallow, single-branch clone with jj already initialized.
@@ -198,5 +204,86 @@ for file in late.txt zy-extra.txt; do
 done
 [[ "$(git -C "$root/fork.git" show fork/main:z.txt)" == "value x and y" ]] || fail "glue resolution lost on rerun"
 ok "a rerun merges the concurrently pushed series and pushes"
+
+# Scenario 6: a clone whose jj state predates changes on the fork remote, the way an Amp orb
+# starts from an old snapshot and then runs plain `git fetch`. Local bookmarks that the remote
+# moved, restacked, or deleted must not win; local-only work must survive and be pushed.
+git clone -q "$root/fork.git" "$root/editor"
+git -C "$root/editor" checkout -q -b patch/ahead origin/main
+printf 'ahead\n' >"$root/editor/ahead.txt"
+git -C "$root/editor" add -A && git -C "$root/editor" commit -qm "patch ahead"
+git -C "$root/editor" push -q origin patch/ahead
+
+git clone -q "$root/fork.git" "$root/orb"
+cd "$root/orb"
+git checkout -q fork/main
+expect_code 0 "$bin" --config "$root/config.toml" init
+expect_code 0 "$bin" --config "$root/config.toml" assemble --push
+# The snapshot knows these bookmarks but does not follow the remote's moves.
+jj bookmark untrack --quiet 'glob:*' --remote origin
+published_notes="$(git -C "$root/fork.git" rev-parse tooling/notes)"
+
+# The fork remote changes: a series is deleted, a glue is restacked onto a moved series, and
+# another series advances.
+cd "$root/editor"
+git fetch -q origin
+git push -q origin --delete tooling/notes
+git checkout -q -B patch/clean origin/patch/clean
+printf 'clean 2\n' >clean2.txt
+git add -A && git commit -qm "patch clean: more"
+git push -q origin patch/clean
+git checkout -q -B patch/zx origin/patch/zx
+printf 'zx 2\n' >zx2.txt
+git add -A && git commit -qm "patch zx: again"
+git push -q origin patch/zx
+git checkout -q -B 'glue/zx+zy' 'origin/glue/zx+zy'
+git reset -q --hard patch/zx
+git merge -q --no-commit --no-ff origin/patch/zy >/dev/null || true
+printf 'value x and y\n' >z.txt
+git add -A && git commit -qm "glue: zx + zy (restacked)"
+git push -q -f origin 'glue/zx+zy'
+want_glue="$(git rev-parse HEAD)"
+want_clean="$(git rev-parse patch/clean)"
+want_zx="$(git rev-parse patch/zx)"
+
+# In the clone: local work, then plain git fetch, as Amp does.
+cd "$root/orb"
+jj new --quiet 'bookmarks(exact:"patch/ahead")' -m "patch ahead: local"
+printf 'local\n' >ahead-local.txt
+jj bookmark set --quiet patch/ahead -r @
+jj new --quiet "main@upstream" -m "tooling: new local"
+printf 'new\n' >newlocal.txt
+jj bookmark create --quiet tooling/newlocal -r @
+git fetch -q --prune origin
+want_ahead="$(jj log --no-graph -r 'bookmarks(exact:"patch/ahead")' -T commit_id)"
+
+expect_code 0 "$bin" --config "$root/config.toml" assemble --no-fetch --push
+contains "$out" "reconciled: tooling/notes"
+contains "$out" "reconciled: patch/clean"
+contains "$out" "reconciled: glue/zx+zy"
+contains "$out" "reconciled: patch/ahead kept"
+fk="$root/fork.git"
+git -C "$fk" rev-parse -q --verify tooling/notes >/dev/null && fail "deleted series was pushed back"
+[[ -z "$(jj bookmark list --color=never 'tooling/notes' 2>/dev/null)" ]] || fail "stale local bookmark tooling/notes remains"
+git -C "$fk" cat-file -e fork/main:NOTES.txt 2>/dev/null && fail "deleted series still merged into fork/main"
+! git -C "$fk" rev-list fork/main^@ | grep -qx "$published_notes" || fail "fork/main merges the deleted series"
+ok "a series deleted on the remote is neither merged nor pushed back"
+
+[[ "$(git -C "$fk" rev-parse 'glue/zx+zy')" == "$want_glue" ]] || fail "glue is not the remote's version"
+[[ "$(git -C "$fk" rev-parse patch/zx)" == "$want_zx" ]] || fail "patch/zx moved off the remote's commit"
+[[ "$(git -C "$fk" rev-parse patch/clean)" == "$want_clean" ]] || fail "patch/clean moved off the remote's commit"
+for file in clean2.txt zx2.txt; do
+  git -C "$fk" cat-file -e "fork/main:$file" || fail "fork/main lacks $file from the remote's series"
+done
+[[ "$(git -C "$fk" show fork/main:z.txt)" == "value x and y" ]] || fail "fork/main lost the glue resolution"
+[[ -z "$(jj log --no-graph -r 'conflicts()' -T commit_id)" ]] || fail "conflicted commits left behind"
+[[ -z "$(jj bookmark list --color=never --conflicted)" ]] || fail "conflicted bookmark left behind"
+ok "restacked glue and advanced series use the remote's commits"
+
+[[ "$(git -C "$fk" rev-parse patch/ahead)" == "$want_ahead" ]] || fail "ahead series not kept and pushed"
+git -C "$fk" cat-file -e fork/main:ahead-local.txt || fail "ahead series not merged"
+git -C "$fk" rev-parse -q --verify tooling/newlocal >/dev/null || fail "new local series not pushed"
+git -C "$fk" cat-file -e fork/main:newlocal.txt || fail "new local series not merged"
+ok "new and ahead local series are kept and pushed"
 
 echo "all $pass scenarios passed"

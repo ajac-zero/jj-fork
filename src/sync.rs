@@ -98,6 +98,8 @@ impl<'a> Session<'a> {
                 "--quiet",
             ])?;
         }
+        // Stale local bookmarks must not win over the remote, so settle them before tracking.
+        crate::reconcile::reconcile(repo, config)?;
         // Series and glues that others pushed become local bookmarks, so the merge includes them.
         crate::init::track(repo, config);
         let origin_snapshot = fork_refs(repo, config)?;
@@ -714,6 +716,23 @@ impl<'a> Session<'a> {
                 bookmarks.push(mirror.clone());
             }
         }
+        // Never push a bookmark backwards: a local commit that is a proper ancestor of the
+        // remote's would drop commits there.
+        bookmarks.retain(|b| {
+            let behind = match (
+                self.repo.rev(&Repo::bookmark_revset(b)),
+                self.repo.rev(&format!("{b:?}@{remote}")),
+            ) {
+                (Ok(ours), Ok(theirs)) => {
+                    ours != theirs && self.repo.is_ancestor(&ours, &theirs).unwrap_or(false)
+                }
+                _ => false,
+            };
+            if behind {
+                report(&format!("not pushing {b}: it is behind {b}@{remote}"));
+            }
+            !behind
+        });
         let mut args = vec![
             "git".to_string(),
             "push".into(),
@@ -804,7 +823,7 @@ pub fn conflict_tier(
     }
 }
 
-fn short(id: &str) -> &str {
+pub fn short(id: &str) -> &str {
     &id[..id.len().min(12)]
 }
 

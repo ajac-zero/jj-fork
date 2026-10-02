@@ -30,6 +30,8 @@ jj fork alias                   add `aliases.fork` to your jj config
 
 `assemble` moves the fork branch only after a conflict-free merge passes the configured fork checks. When the merge conflicts, it names each conflicting pair and the glue that would resolve it. `--push` fetches again first and refuses to push if someone else pushed a series, glue, or the fork branch during the run.
 
+Before anything else, every command reconciles local bookmarks in the fork's namespaces (fork branch, mirror, series, glue) against the fork remote, with or without `--no-fetch`, so a stale clone (an old snapshot, or a plain `git fetch` that jj never saw) cannot resurrect or overwrite remote state. Each change is a `reconciled:` line naming its rule: (1) local behind the remote moves to it; (2) a conflicted bookmark is set to the remote's commit; (3) local ahead of or diverged from the remote is kept as unpushed work and reported, except (3b) a diverged commit that is already on a remote ref (the remote restacked or rebased it) takes the remote's commit; (4) a bookmark missing on the remote whose commit is reachable from a remote ref was deleted after publishing, so it is forgotten locally; (5) any other bookmark missing on the remote is new work and kept. Nothing on the remote is deleted, and `--push` skips any bookmark that is behind its remote.
+
 Exit codes: `0` nothing to do or success, `10` (`check`) every stale series is clean, `20` a series or merge needs a person or an agent, `1` error. Reports go to stdout, progress to stderr.
 
 ## Install

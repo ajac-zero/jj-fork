@@ -6,6 +6,7 @@ mod checks;
 mod config;
 mod glue;
 mod init;
+mod reconcile;
 mod repo;
 mod run;
 mod sync;
