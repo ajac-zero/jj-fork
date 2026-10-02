@@ -119,6 +119,19 @@ expect_code 20 "$bin" --config "$root/config.toml" sync --push
 contains "$out" "fork/main conflict [tier=medium] — merge"
 contains "$out" "conflicting pair: patch/zx + patch/zy: add glue/zx+zy with: jj new"
 [[ -z "$(jj log --no-graph -r 'conflicts()' -T commit_id)" ]] || fail "conflicted merge left behind although a pair was named"
+
+# With three conflicting series, pairs are listed in name order, not commit-id order, so "the
+# first pair" an agent is told to glue is the same on every run.
+jj new --quiet "main@upstream" -m "patch w"
+printf 'value w\n' >z.txt
+jj bookmark create --quiet patch/zw -r @
+expect_code 20 "$bin" --config "$root/config.toml" assemble --no-fetch
+pairs="$(grep -o 'conflicting pair: [^:]*' <<<"$out")"
+[[ "$pairs" == "conflicting pair: patch/zw + patch/zx
+conflicting pair: patch/zw + patch/zy
+conflicting pair: patch/zx + patch/zy" ]] || { echo "$out" >&2; fail "conflicting pairs not in name order"; }
+jj abandon --quiet 'bookmarks(exact:"patch/zw")'
+
 jj new --quiet 'bookmarks(exact:"patch/zx")' 'bookmarks(exact:"patch/zy")' -m "glue: zx + zy"
 printf 'value x and y\n' >z.txt
 jj bookmark create --quiet 'glue/zx+zy' -r @
@@ -153,5 +166,37 @@ expect_code 0 "$bin" --config "$root/config.toml" assemble --no-checks
 contains "$out" "fork/main already merges upstream and every series"
 [[ "$(git rev-parse --is-shallow-repository)" == false ]] || fail "still shallow"
 ok "a shallow clone is unshallowed and sees the real fork/main parents"
+
+# Scenario 5: someone pushes a series while assemble --push is checking its candidate. The fork
+# check stands in for that concurrent push; it runs after jj-fork's first fetch and before its
+# push, and pushing the same commit again later changes nothing.
+git clone -q "$root/fork.git" "$root/other"
+cd "$root/other"
+git checkout -q -b patch/late origin/main
+printf 'late\n' >late.txt
+git add -A && git commit -qm "patch late"
+sed "s|^fork = \[|&\n  { name = \"concurrent push\", run = \"git -C $root/other push -q origin patch/late\" },|" \
+  "$root/config.toml" >"$root/config-concurrent.toml"
+grep -qF 'concurrent push' "$root/config-concurrent.toml" || fail "concurrent-push check not added"
+
+cd "$root/work"
+jj new --quiet 'bookmarks(exact:"patch/zy")' -m "patch y: more"
+printf 'more\n' >zy-extra.txt
+jj bookmark set --quiet patch/zy -r @
+before="$(git -C "$root/fork.git" for-each-ref)"
+expect_code 20 "$bin" --config "$root/config-concurrent.toml" assemble --push
+contains "$out" "origin changed while jj-fork ran; nothing pushed. Changed on origin:"
+contains "$out" "  patch/late"
+contains "$out" "rerun: jj fork assemble --push"
+[[ "$(git -C "$root/fork.git" for-each-ref | grep -v 'refs/heads/patch/late$')" == "$before" ]] ||
+  fail "a ref other than patch/late changed on the fork remote although the push was refused"
+ok "assemble --push refuses when the remote changed during the run"
+
+expect_code 0 "$bin" --config "$root/config-concurrent.toml" assemble --push
+for file in late.txt zy-extra.txt; do
+  git -C "$root/fork.git" cat-file -e "fork/main:$file" || fail "rerun did not merge $file into fork/main"
+done
+[[ "$(git -C "$root/fork.git" show fork/main:z.txt)" == "value x and y" ]] || fail "glue resolution lost on rerun"
+ok "a rerun merges the concurrently pushed series and pushes"
 
 echo "all $pass scenarios passed"

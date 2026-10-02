@@ -495,22 +495,26 @@ impl<'a> Session<'a> {
     }
 
     /// Each pair of merge parents that conflicts on its own, with the glue that would resolve it.
+    /// Pairs are ordered by name, within and across pairs, so reports do not depend on commit
+    /// ids and the first pair an agent is told to glue is the same on every run.
     fn conflicting_pairs(&self, parents: &[String]) -> Result<Vec<String>> {
         let fork = &self.config.fork;
         let mut prefixes = fork.series_prefixes.clone();
         prefixes.push(fork.glue_prefix.clone());
-        let names: Vec<String> = parents
+        let mut named: Vec<(String, &String)> = parents
             .iter()
             .map(|c| {
-                Ok(self
+                let name = self
                     .repo
                     .bookmark_on(c, &prefixes)?
-                    .unwrap_or_else(|| short(c).to_string()))
+                    .unwrap_or_else(|| short(c).to_string());
+                Ok((name, c))
             })
             .collect::<Result<_>>()?;
+        named.sort();
         let mut pairs = Vec::new();
-        for i in 0..parents.len() {
-            for j in i + 1..parents.len() {
+        for (i, (a, a_commit)) in named.iter().enumerate() {
+            for (b, b_commit) in &named[i + 1..] {
                 let clean = crate::run::succeeds(
                     &self.repo.root,
                     "git",
@@ -519,17 +523,11 @@ impl<'a> Session<'a> {
                         "--write-tree",
                         "--name-only",
                         "--no-messages",
-                        &parents[i],
-                        &parents[j],
+                        a_commit,
+                        b_commit,
                     ],
                 )?;
                 if !clean {
-                    // Order each pair by name so reports do not depend on commit ids.
-                    let (a, b) = if names[i] <= names[j] {
-                        (&names[i], &names[j])
-                    } else {
-                        (&names[j], &names[i])
-                    };
                     let glue = glue::suggested(a, b, &fork.glue_prefix, &fork.series_prefixes);
                     pairs.push(format!(
                         "{a} + {b}: add {glue} with: jj new '{}' '{}'",
