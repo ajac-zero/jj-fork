@@ -1,0 +1,28 @@
+#!/usr/bin/env bash
+# Prepares an Amp orb for jj-fork: the Rust toolchain, jj, and a warm build for tests/e2e.sh.
+set -euo pipefail
+cd "$(dirname "${BASH_SOURCE[0]}")/.."
+
+step() { printf '\n== %s (%(%T)T)\n' "$*" -1; }
+
+step "rust toolchain"
+if ! command -v rustup >/dev/null && [[ ! -x "$HOME/.cargo/bin/rustup" ]]; then
+  # rustup adds ~/.cargo/env to the shell profiles, so later login shells find cargo.
+  curl -fsSL --proto '=https' --tlsv1.2 https://sh.rustup.rs |
+    sh -s -- -y --profile minimal --default-toolchain stable --component clippy,rustfmt
+fi
+# The installer cannot update this running script's environment.
+# shellcheck disable=SC1091
+source "$HOME/.cargo/env"
+rustup toolchain install stable --profile minimal --component clippy,rustfmt --no-self-update
+rustc --version
+
+step "jj"
+scripts/install-jj "$HOME/.local/bin"
+
+# Warm the target directory. tests/e2e.sh runs target/debug/jj-fork.
+step "cargo build"
+cargo build --locked --all-targets
+cargo clippy --locked --all-targets --quiet
+
+step "done"

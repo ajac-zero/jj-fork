@@ -90,8 +90,11 @@ See [examples/ai-gateway.toml](examples/ai-gateway.toml) for a complete configur
 
 ```sh
 cargo test           # unit tests
+cargo build          # tests/e2e.sh runs target/debug/jj-fork; cargo test does not rebuild it
 tests/e2e.sh         # end-to-end scenarios against throwaway local repositories
 ```
+
+The end-to-end tests need `jj` and `git` on `PATH`. `scripts/install-jj [DIR]` installs the jj release that CI uses.
 
 ## License
 
