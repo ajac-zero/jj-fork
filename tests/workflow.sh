@@ -243,6 +243,14 @@ bad_output() {
   expect 2 "$bin" apply "$d/plan.json" --no-checks
 }
 
+apply_config_override() {
+  fixture apply-config; save
+  cp "$d/config.toml" "$d/other-config.toml"
+  expect 1 "$bin" --config "$d/other-config.toml" apply "$d/plan.json"
+  grep -q 'apply cannot use --config' "$d/err" || fail 'apply config refusal was not explained'
+  grep -q 'Omit --config' "$d/err" || fail 'apply config refusal gave no remedy'
+}
+
 wrong_repository() {
   fixture wrong-repo; save
   git clone -q "$d/fork.git" "$d/other"
@@ -318,6 +326,7 @@ run_case expired-object expired_object
 run_case intermediate-conflict-handles intermediate_handles
 run_case saved-no-op-guard no_op_guard
 run_case atomic-output-and-flags bad_output
+run_case apply-config-override apply_config_override
 run_case wrong-repository wrong_repository
 run_case wrong-workspace wrong_workspace
 run_case inside-source-artifacts artifact_paths

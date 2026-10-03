@@ -657,7 +657,9 @@ fn apply_authenticated(
     if let Some(path) = config_override {
         ensure!(
             std::fs::canonicalize(path)? == plan.context.config_path,
-            "apply cannot override the saved configuration"
+            "apply cannot use --config {}: the plan was saved with {}. Omit --config to use the saved configuration, or prepare a new plan with the intended file",
+            path.display(),
+            plan.context.config_path.display()
         );
     }
     let config = Config::load(&repo.root, Some(&plan.context.config_path))?;
