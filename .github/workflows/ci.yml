@@ -30,3 +30,12 @@ jobs:
       # tests/e2e.sh runs target/debug/jj-fork, which cargo test does not rebuild.
       - run: cargo build --locked
       - run: tests/e2e.sh
+      - run: bash tests/transaction.sh
+
+  msrv:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install minimum supported Rust
+        run: rustup toolchain install 1.89.0 --profile minimal --no-self-update
+      - run: cargo +1.89.0 check --locked

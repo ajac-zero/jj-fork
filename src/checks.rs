@@ -69,6 +69,7 @@ impl<'a> Checker<'a> {
             .log_dir
             .join(format!("{}.log", log_name.replace('/', "_")));
         let _ = std::fs::remove_file(&log);
+        let initial_head = run::output(dir, "git", &["rev-parse", "--verify", "HEAD"])?;
         let packages = go_packages(dir, &self.target)?;
         for check in checks {
             let packages_arg = packages.join(" ");
@@ -114,6 +115,29 @@ impl<'a> Checker<'a> {
                     });
                 }
             }
+        }
+        // Checks certify this exact commit, not a tree they leave behind. Do not snapshot
+        // their edits; ordinary untracked/ignored build artifacts are allowed here (the
+        // generated-files policy above remains stricter).
+        let head = run::output(dir, "git", &["rev-parse", "--verify", "HEAD"]);
+        let status = run::output(
+            dir,
+            "git",
+            &["status", "--porcelain", "--untracked-files=no"],
+        )?;
+        if head.as_ref().ok() != Some(&initial_head) || !status.is_empty() {
+            append(
+                &log,
+                &format!(
+                    "jj-fork-check: candidate integrity\nchecks changed the candidate: expected HEAD {initial_head}, got {}\ntracked working-tree/index changes:\n{status}\n",
+                    head.unwrap_or_else(|e| format!("unavailable ({e})")),
+                ),
+            )?;
+            return Ok(Outcome::Fail {
+                check: "candidate integrity".into(),
+                tier: "medium".into(),
+                log,
+            });
         }
         Ok(Outcome::Pass)
     }
@@ -447,6 +471,63 @@ pub fn compiler_errors(log: &str) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn successful_checks_must_leave_the_candidate_intact() {
+        for (command, passes, diagnostic) in [
+            ("git checkout --detach HEAD^", false, "expected HEAD"),
+            ("printf changed > tracked", false, "M tracked"),
+            (
+                "printf changed > tracked; git add tracked",
+                false,
+                "M  tracked",
+            ),
+            (
+                "printf artifact > artifact; printf ignored > ignored",
+                true,
+                "",
+            ),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path();
+            run::output(path, "git", &["init", "-q"]).unwrap();
+            run::output(path, "git", &["config", "user.name", "test"]).unwrap();
+            run::output(path, "git", &["config", "user.email", "test@example.com"]).unwrap();
+            std::fs::write(path.join("tracked"), "original").unwrap();
+            std::fs::write(path.join(".gitignore"), "ignored\n").unwrap();
+            run::output(path, "git", &["add", "."]).unwrap();
+            run::output(path, "git", &["commit", "-qm", "first"]).unwrap();
+            run::output(path, "git", &["commit", "--allow-empty", "-qm", "second"]).unwrap();
+            let repo = Repo { root: path.into() };
+            let config: Config = toml::from_str("[upstream]\nurl = 'unused'\n").unwrap();
+            let target = run::output(path, "git", &["rev-parse", "HEAD"]).unwrap();
+            let mut checker = Checker::new(&repo, &config, target, path.into(), path.into());
+            let checks: Vec<Check> = toml::from_str::<crate::config::Checks>(&format!(
+                "patch = [{{name = 'mutator', run = {command:?}}}]"
+            ))
+            .unwrap()
+            .patch;
+            match checker.run(path, &checks, true, "candidate").unwrap() {
+                Outcome::Pass => assert!(passes, "accepted {command}"),
+                Outcome::Fail { check, tier, log } => {
+                    assert!(!passes, "rejected {command}");
+                    assert_eq!(check, "candidate integrity");
+                    assert_eq!(tier, "medium");
+                    let text = std::fs::read_to_string(log).unwrap();
+                    assert!(text.contains(diagnostic), "{text}");
+                }
+            }
+            if passes {
+                assert!(path.join("artifact").exists());
+                assert!(path.join("ignored").exists());
+            } else if command.contains("printf") {
+                assert_eq!(
+                    std::fs::read_to_string(path.join("tracked")).unwrap(),
+                    "changed"
+                );
+            }
+        }
+    }
 
     #[test]
     fn go_test_failures_attribute_tests_to_packages() {

@@ -24,17 +24,23 @@ jj fork assemble [--push]       restack glues, then build, check, and move the f
 jj fork alias                   add `aliases.fork` to your jj config
 ```
 
-`check` replays every stale series onto upstream in a throwaway worktree and runs the configured patch checks. Each problem gets a difficulty tier (`[tier=low|medium|high]`) from the size of the conflict, or from the check that failed, so an automated fixer can pick a matching model.
+`check` constructs each stale series as an unpublished jj candidate, then materializes that exact commit in a detached Git worktree and runs the configured patch checks there. Each problem gets a difficulty tier (`[tier=low|medium|high]`) from the size of the conflict, or from the check that failed, so an automated fixer can pick a matching model.
 
-`sync` changes nothing unless every stale series is clean. It then rebases them with jj, verifies each result has the same tree as the checked replay, fast-forwards the mirror branch, and assembles.
+`sync` and `assemble` use the same candidate-first transaction model: plan the jj operations and checks against unpublished candidates in detached worktrees; publish local bookmarks only after the required checks pass and the source state is still current. Checks do not change the source checkout. A stale local operation or source edit discovered while checks run makes the command refuse publication and preserve that work. A failed check discards planned maintenance rather than partially rebasing a series or moving the fork branch. Preparation (including snapshot, fetch, and reconciliation) remains separate and may already have changed local state; discarded transactions may also leave unreachable objects. This is not byte-for-byte rollback or filesystem/remote atomicity.
 
-`assemble` moves the fork branch only after a conflict-free merge passes the configured fork checks. When the merge conflicts, it names each conflicting pair and the glue that would resolve it. `--push` fetches again first and refuses to push if someone else pushed a series, glue, or the fork branch during the run.
+Series and glues are copied onto new parents with new jj change IDs, preserving the original commits and their unrelated descendants. `assemble` checks a conflict-free fork candidate before moving the fork branch. If conflicting glue or multiway repair state is deliberately needed, that state may be published without moving the fork branch or pushing. Export or checkout errors can occur after local publication and are reported as partial failure.
 
-No silent drops: before it moves the fork branch, and again right before `--push`, `assemble` checks every series and glue bookmark on the fork remote. Each must be merged into the new fork branch or deliberately deleted in this clone (the remote bookmark is tracked and the local one is gone, in jj a pending deletion). Otherwise it refuses, names each such bookmark, and exits `20`. A remote bookmark this clone never tracked counts as not deleted.
+With `--push`, jj-fork fetches again and checks a final remote snapshot, including the mirror. It refuses to push when the guarded refs changed during the run; the successful local operation remains published. Push uses per-ref leases, but neither those leases nor the snapshot make multi-ref publication or remote membership atomic. No silent drops: before moving the fork branch, and again before pushing, `assemble` checks every series and glue bookmark on the fork remote. Each must be merged into the new fork branch or deliberately deleted locally (in jj, a pending deletion); otherwise it refuses, names the bookmark, and exits `20`. A remote bookmark this clone never tracked counts as not deleted. Nothing on the remote is deleted.
 
 Before anything else, every command reconciles local bookmarks in the fork's namespaces (fork branch, mirror, series, glue) against the fork remote, with or without `--no-fetch`, so a stale clone (an old snapshot, or a plain `git fetch` that jj never saw) cannot resurrect or overwrite remote state. Each change is a `reconciled:` line naming its rule: (1) local behind the remote moves to it; (2) a conflicted bookmark is set to the remote's commit; (3) local ahead of or diverged from the remote is kept as unpushed work and reported, except (3b) a diverged commit that is already on a remote ref (the remote restacked or rebased it) takes the remote's commit; (4) a bookmark missing on the remote whose commit is reachable from a remote ref was deleted after publishing, so it is forgotten locally; (5) any other bookmark missing on the remote is new work and kept. Nothing on the remote is deleted, and `--push` skips any bookmark that is behind its remote.
 
-Exit codes: `0` nothing to do or success, `10` (`check`) every stale series is clean, `20` a series or merge needs a person or an agent, `1` error. Reports go to stdout, progress to stderr.
+Exit codes: `0` nothing to do or success, `10` (`check`) every stale series is clean, `20` a series or merge needs a person or an agent, `1` error (including a reported partial failure after local publication). Reports go to stdout, progress to stderr.
+
+## jj version
+
+The engine uses `jj-lib` pinned to `=0.43.0`. Use jj CLI 0.43.0 for preparation and Git transport. The experimental jj-lib API is version-coupled to that release; other jj-lib versions are not supported.
+
+Native maintenance supports colocated Git repositories with jj's default stores and local working copy; Watchman support is not enabled. See [the implementation plan](IMPLEMENTATION_PLAN.md) for the integration boundaries, verification evidence, and following milestones.
 
 ## Install
 
@@ -96,6 +102,7 @@ See [examples/ai-gateway.toml](examples/ai-gateway.toml) for a complete configur
 cargo test           # unit tests
 cargo build          # tests/e2e.sh runs target/debug/jj-fork; cargo test does not rebuild it
 tests/e2e.sh         # end-to-end scenarios against throwaway local repositories
+tests/transaction.sh # transactional candidate and publication scenarios
 ```
 
 The end-to-end tests need `jj` and `git` on `PATH`. `scripts/install-jj [DIR]` installs the jj release that CI uses.

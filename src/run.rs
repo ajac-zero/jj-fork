@@ -1,5 +1,6 @@
-//! Process helpers. jj-fork drives `jj`, `git`, and the configured check commands as child
-//! processes, so it works across jj versions without linking jj's internals.
+//! Process helpers. jj-fork prepares clones and pushes with the pinned `jj` CLI, materializes
+//! check worktrees with `git`, and runs the configured check commands as child processes.
+//! Maintenance itself runs in-process through jj-lib (see `native`).
 
 use std::fs::File;
 use std::path::Path;

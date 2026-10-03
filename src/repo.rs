@@ -1,4 +1,4 @@
-//! jj and git queries against the colocated repository.
+//! jj CLI and git queries against the colocated repository, for preparation and checks.
 
 use std::path::{Path, PathBuf};
 
@@ -90,105 +90,12 @@ impl Repo {
         Ok(names)
     }
 
-    /// Names under `prefixes` deliberately deleted in this clone: the bookmark is tracked on
-    /// `remote` but absent locally, so the deletion waits to be pushed. A remote bookmark that is
-    /// untracked, or that jj does not know at all, is not in this set.
-    pub fn deleted_locally(&self, remote: &str, prefixes: &[String]) -> Result<Vec<String>> {
-        let mut args = vec![
-            "bookmark".to_string(),
-            "list".into(),
-            "--color=never".into(),
-            "--all-remotes".into(),
-        ];
-        args.extend(prefixes.iter().map(|p| format!("glob:{p}*")));
-        args.extend([
-            "-T".into(),
-            r#"name ++ "\t" ++ if(remote, remote, "") ++ "\t" ++ present ++ "\t" ++ tracked ++ "\n""#.into(),
-        ]);
-        let args: Vec<&str> = args.iter().map(String::as_str).collect();
-        let out = self.jj(&args)?;
-        let mut local = std::collections::BTreeSet::new();
-        let mut tracked = std::collections::BTreeSet::new();
-        for line in out.lines() {
-            let f: Vec<&str> = line.split('\t').collect();
-            if f.len() != 4 {
-                continue;
-            }
-            if f[1].is_empty() && f[2] == "true" {
-                local.insert(f[0].to_string());
-            } else if f[1] == remote && f[2] == "true" && f[3] == "true" {
-                tracked.insert(f[0].to_string());
-            }
-        }
-        Ok(tracked.difference(&local).cloned().collect())
-    }
-
-    /// Remote-tracking refs of `remote` as `name commit` lines, for detecting concurrent pushes.
-    pub fn remote_refs(&self, remote: &str) -> Result<Vec<String>> {
-        let out = self.git(&[
-            "for-each-ref",
-            "--format=%(refname:lstrip=3) %(objectname)",
-            &format!("refs/remotes/{remote}/"),
-        ])?;
-        Ok(out.lines().map(str::to_string).collect())
-    }
-
-    /// The first local bookmark on `commit` that starts with one of `prefixes`.
-    pub fn bookmark_on(&self, commit: &str, prefixes: &[String]) -> Result<Option<String>> {
-        let out = self.jj(&[
-            "log",
-            "--no-graph",
-            "--color=never",
-            "-r",
-            commit,
-            "-T",
-            "local_bookmarks.map(|b| b.name() ++ \"\\n\").join(\"\")",
-        ])?;
-        Ok(out
-            .lines()
-            .find(|name| prefixes.iter().any(|p| name.starts_with(p.as_str())))
-            .map(str::to_string))
-    }
-
-    pub fn has_conflicts(&self, revset: &str) -> Result<bool> {
-        Ok(!self
-            .jj(&[
-                "log",
-                "--no-graph",
-                "-r",
-                &format!("({revset}) & conflicts()"),
-                "-T",
-                "commit_id",
-            ])?
-            .is_empty())
-    }
-
-    pub fn op_id(&self) -> Result<String> {
-        self.jj(&["op", "log", "-n1", "--no-graph", "-T", "self.id()"])
-    }
-
-    pub fn op_restore(&self, op: &str) -> Result<()> {
-        self.jj(&["op", "restore", "--quiet", op]).map(|_| ())
-    }
-
     pub fn is_ancestor(&self, ancestor: &str, descendant: &str) -> Result<bool> {
         run::succeeds(
             &self.root,
             "git",
             &["merge-base", "--is-ancestor", ancestor, descendant],
         )
-    }
-
-    pub fn merge_base(&self, a: &str, b: &str) -> Result<String> {
-        self.git(&["merge-base", a, b])
-    }
-
-    pub fn subject(&self, commit: &str) -> Result<String> {
-        self.git(&["log", "-1", "--format=%s", commit])
-    }
-
-    pub fn tree(&self, commit: &str) -> Result<String> {
-        self.git(&["rev-parse", &format!("{commit}^{{tree}}")])
     }
 
     pub fn is_shallow(&self) -> Result<bool> {
@@ -216,12 +123,6 @@ impl Repo {
 pub struct Worktree {
     repo: PathBuf,
     pub path: PathBuf,
-}
-
-impl Worktree {
-    pub fn git(&self, args: &[&str]) -> Result<String> {
-        run::output(&self.path, "git", args)
-    }
 }
 
 impl Drop for Worktree {
