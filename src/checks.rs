@@ -499,7 +499,9 @@ fn generated_current(
             &["status", "--porcelain", "--untracked-files=all"],
         )?;
         for line in status.lines() {
-            let file = dir.join(line.get(3..).unwrap_or_default());
+            // `run::output` trims stdout, which drops the leading space of the first line's
+            // status (" M path"), so skip the two status columns and any separator instead.
+            let file = dir.join(line.get(2..).unwrap_or_default().trim_start());
             restore_header(&file, &header.text, &header.comments)?;
         }
     }
@@ -779,5 +781,31 @@ FAIL\texample.com/m/c [build failed]
             std::fs::read_to_string(&file).unwrap(),
             "# Copyright A\n# Line two\n\n---\nkind: X\n"
         );
+    }
+
+    /// A generator that drops the header from the only changed file: the first (and only)
+    /// porcelain line starts with a space, which trimmed output loses.
+    #[test]
+    fn header_is_restored_on_the_first_status_line() {
+        let dir = tempfile::tempdir().unwrap();
+        let git = |args: &[&str]| run::output(dir.path(), "git", args).unwrap();
+        git(&["init", "-q"]);
+        std::fs::write(dir.path().join("a.yaml"), "# Copyright A\n\nkind: X\n").unwrap();
+        git(&["add", "."]);
+        git(&[
+            "-c",
+            "user.name=t",
+            "-c",
+            "user.email=t@e",
+            "commit",
+            "-qm",
+            "a",
+        ]);
+        let generated: Generated = toml::from_str(
+            "paths = ['a.yaml']\nregenerate = \"printf 'kind: X\\\\n' > a.yaml\"\n[header]\ntext = 'Copyright A'\ncomments = { yaml = '#' }\n",
+        )
+        .unwrap();
+        let log = dir.path().join(".git").join("log");
+        assert!(generated_current(dir.path(), &generated, &[], &log).unwrap());
     }
 }

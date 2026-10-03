@@ -95,4 +95,6 @@ The no-silent-drop guard refuses to move `fork/main` while a series/glue bookmar
 - Ignored upstream failures print `note: also fails on upstream, ignored`; do not "fix" them in a patch.
 - Native commands do not need the jj CLI after `init`; git and jj must be on PATH for init/aliases, worktrees, and checks.
 - Conflict-only run: `--no-checks` (not `--no-tests`) skips configured checks; it cannot be combined with `--save-plan`/`apply`.
+- A full `check`/`sync` on a large Go repo takes tens of minutes (ai-gateway: ~30 min, ~3 GB, dominated by tests); a conflict-only `--no-checks` run takes about a second. Run the scheduled owner with a generous timeout.
+- `jj fork init` writes only the revset aliases (`trunk()`, `fork_patches()`, `fork_glue()`, `fork_parents()`, `fork_head()`), not command aliases like `patch-new` or `fork-log`.
 - Not provided by jj-fork (keep in the repo's own skill or scripts): PR-head bookmarks, creating or retiring series, a Ship-button prompt that turns a thread into a series, `jj patch-new`/`fork-assemble`-style aliases, and orb bootstrap beyond `jj fork init`. A stale-script check is unnecessary because jj-fork is an installed binary; pin its version in setup instead.
