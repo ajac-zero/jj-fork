@@ -568,8 +568,10 @@ pub fn validate_proposal(
     }
     if plan.outcome == PlanOutcome::Ready {
         ensure!(
-            matches!(plan.context.command.as_str(), "sync" | "assemble")
-                && plan.context.checks_enabled,
+            matches!(
+                plan.context.command.as_str(),
+                "sync" | "assemble" | "retire"
+            ) && plan.context.checks_enabled,
             "plan was not built with mandatory checks"
         );
         ensure!(

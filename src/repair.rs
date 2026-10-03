@@ -252,6 +252,10 @@ fn start(
     let repository = canonical(jj.repository_path())?;
     let plan = artifact::load_plan(plan_path, &repository)?;
     ensure_same_source(repo, &repository, &plan)?;
+    ensure!(
+        plan.context.command != "retire",
+        "retirement plans cannot be repaired; fix the remaining series/glues in the source and prepare retirement again"
+    );
     let issue = plan
         .issues
         .iter()

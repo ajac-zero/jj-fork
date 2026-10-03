@@ -18,6 +18,8 @@ upstream main ──┬── patch/a ──┬───────────
 
 ```text
 jj fork init [--upstream URL]   prepare a clone: remotes, full history, jj, tracking, revset aliases
+jj fork create patch/NAME -m MESSAGE  start an empty, editable series on upstream
+jj fork retire patch/NAME [--remove-glue glue/a+b]... [--save-plan FILE] [--push]
 jj fork check [--report FILE]   report each series: up-to-date, clean, conflict, or broken
 jj fork sync [--save-plan FILE] plan clean series updates and fork assembly
 jj fork assemble [--save-plan FILE] plan glue restacks and fork assembly
@@ -31,9 +33,19 @@ jj fork alias                   add `aliases.fork` to your jj config
 
 `sync` and `assemble` use the same candidate-first transaction model: plan the jj operations and checks against unpublished candidates in detached worktrees; publish local bookmarks only after the required checks pass and the source state is still current. Checks do not change the source checkout. A stale local operation or source edit discovered while checks run makes the command refuse publication and preserve that work. A failed check discards planned maintenance rather than partially rebasing a series or moving the fork branch. Preparation (including snapshot, fetch, and reconciliation) remains separate and may already have changed local state; discarded transactions may also leave unreachable objects. This is not byte-for-byte rollback or filesystem/remote atomicity.
 
+## Series lifecycle
+
+`create` accepts a full bookmark name under a configured series prefix, such as `patch/my-fix` or `tooling/agent-workflow`. It creates an empty commit directly on upstream, sets that bookmark, and selects it as the working copy. It refuses unfinished working-copy changes, invalid names, `+` in the series name, and names already used locally or on a known remote (including the same suffix under another configured prefix). Edit the series with jj, then run `assemble`; creation never assembles or pushes.
+
+`retire` deliberately stops including a series in the fork. Confirm upstream has absorbed it, or that you intend to drop it; the command does not infer semantic equivalence with upstream. It lists dependent glues and refuses unless each is explicitly approved with `--remove-glue NAME`. Review those resolutions first: a glue over three series can contain fixes still needed by the two remaining series. The reduced fork must be conflict-free and pass configured fork checks, even when its parent set is unchanged. Any refusal discards all planned removals, including partial glue repair state.
+
+Retirement supports `--report`, `--save-plan`, `--no-fetch`, and `--push`, but never skips checks. A successful saved retirement plan can be applied normally. A failed retirement plan cannot use `repair start`; fix the remaining series/glues in the source and prepare retirement again.
+
+Commit history and separate PR-head bookmarks are preserved. Even with `--push`, retirement never deletes remote selectors or glues: it pushes the reduced fork and remaining members only. Removal remains a local pending deletion, which subsequent preparation preserves. Other clones can still select those remote refs; coordinate explicit remote deletion separately if retirement should be permanent across clones.
+
 ## Saved plans and reports
 
-Use `check --report FILE` to write a report, or `sync`/`assemble --save-plan FILE [--report FILE]` to save validated candidate work for later application. Saving a plan does not publish maintenance or push; normal preparation may still snapshot, fetch, and reconcile the repository. `--save-plan` cannot be combined with `--push` or `--no-checks`.
+Use `check --report FILE` to write a report, or `sync`/`assemble`/`retire --save-plan FILE [--report FILE]` to save validated candidate work for later application. Saving a plan does not publish maintenance or push; normal preparation may still snapshot, fetch, and reconcile the repository. `--save-plan` cannot be combined with `--push` or `--no-checks`.
 
 Apply a saved plan with `jj fork apply PLAN [--push] [--report FILE]`. Apply authenticates the repository-local plan and its frozen preconditions, reruns the configured checks on the exact candidates, then compare-and-swap publishes only a successful candidate. Apply has no target, `--no-fetch`, or `--no-checks` override: the checked inputs cannot be silently changed at application time. Reports are informational, not executable instructions; plan and report formats are version-strict, and the tool never runs commands embedded in artifacts.
 

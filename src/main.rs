@@ -58,6 +58,31 @@ enum Command {
         #[arg(long)]
         candidate: Option<String>,
     },
+    /// Start an empty, editable series on upstream. Never assembles or pushes.
+    Create {
+        /// Full bookmark name under a configured series prefix, e.g. patch/my-fix.
+        name: String,
+        #[arg(short, long)]
+        message: String,
+        #[arg(long)]
+        no_fetch: bool,
+    },
+    /// Remove a series and explicitly approved dependent glues after checking the reduced fork.
+    /// Remote refs and separate PR-head bookmarks are retained.
+    Retire {
+        name: String,
+        /// A dependent glue whose entire resolution may be removed; repeat for every dependency.
+        #[arg(long)]
+        remove_glue: Vec<String>,
+        #[arg(long)]
+        no_fetch: bool,
+        #[arg(long, conflicts_with = "save_plan")]
+        push: bool,
+        #[arg(long)]
+        save_plan: Option<PathBuf>,
+        #[arg(long)]
+        report: Option<PathBuf>,
+    },
     /// Authenticate and apply an exact saved proposal after rerunning its required checks.
     Apply {
         file: PathBuf,
@@ -75,7 +100,7 @@ enum Command {
     Alias,
 }
 
-#[derive(Args)]
+#[derive(Args, Default)]
 struct SyncArgs {
     /// Upstream revision to update to. Defaults to the upstream branch after fetching.
     #[arg(long)]
@@ -122,7 +147,7 @@ fn execute(cli: Cli) -> Result<i32> {
         Command::Check(args) | Command::Sync(args) | Command::Assemble { args, .. } => {
             args.report.clone()
         }
-        Command::Apply { report, .. } => report.clone(),
+        Command::Apply { report, .. } | Command::Retire { report, .. } => report.clone(),
         _ => None,
     };
     let mut reported = false;
@@ -199,6 +224,12 @@ fn execute_inner(cli: Cli, reported: &mut bool) -> Result<i32> {
         save_plan: args.save_plan,
         report_path: args.report,
     };
+    let retirement = match &cli.command {
+        Command::Retire {
+            name, remove_glue, ..
+        } => Some((name.clone(), remove_glue.clone())),
+        _ => None,
+    };
     let (mut session, command) = match cli.command {
         Command::Init { .. } => {
             init::init(&repo, &config)?;
@@ -223,11 +254,58 @@ fn execute_inner(cli: Cli, reported: &mut bool) -> Result<i32> {
             Session::new(&repo, &config, options(args, candidate, "assemble"))?,
             "assemble",
         ),
+        Command::Create {
+            name,
+            message,
+            no_fetch,
+        } => {
+            let mut session = Session::new(
+                &repo,
+                &config,
+                options(
+                    SyncArgs {
+                        no_fetch,
+                        ..Default::default()
+                    },
+                    None,
+                    "create",
+                ),
+            )?;
+            return session.create(&name, &message);
+        }
+        Command::Retire {
+            no_fetch,
+            push,
+            save_plan,
+            report,
+            ..
+        } => (
+            Session::new(
+                &repo,
+                &config,
+                options(
+                    SyncArgs {
+                        no_fetch,
+                        push,
+                        save_plan,
+                        report,
+                        ..Default::default()
+                    },
+                    None,
+                    "retire",
+                ),
+            )?,
+            "retire",
+        ),
         Command::Apply { .. } | Command::Repair { .. } => unreachable!(),
     };
     let result = match command {
         "check" => session.check(),
         "sync" => session.sync(),
+        "retire" => {
+            let (name, glues) = retirement.as_ref().unwrap();
+            session.retire(name, glues)
+        }
         _ => session.assemble_command(),
     };
     let code = match result {

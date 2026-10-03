@@ -288,6 +288,152 @@ impl<'a> Session<'a> {
         self.conclude(assembled, "assemble")
     }
 
+    /// Starts an empty, editable series on upstream; never assembles or pushes it.
+    pub fn create(&mut self, name: &str, message: &str) -> Result<i32> {
+        let suffix = self.series_suffix(name)?;
+        anyhow::ensure!(
+            crate::run::succeeds(
+                &self.repo.root,
+                "git",
+                &["check-ref-format", "--branch", name]
+            )?,
+            "invalid series bookmark name {name}"
+        );
+        for prefix in &self.config.fork.series_prefixes {
+            let other = format!("{prefix}{suffix}");
+            let local = self
+                .tx
+                .repo()
+                .view()
+                .get_local_bookmark(jj_lib::ref_name::RefName::new(&other));
+            let remote_exists = self.tx.repo().view().remote_views().any(|(_, view)| {
+                view.bookmarks
+                    .get(jj_lib::ref_name::RefName::new(&other))
+                    .is_some_and(|r| r.target.is_present())
+            });
+            anyhow::ensure!(
+                !local.is_present() && !remote_exists,
+                "series name {suffix} is already reserved by {other} locally or on a remote"
+            );
+        }
+        let wc = native::commit(self.tx.repo(), &self.jj.wc_commit)?;
+        let parent_tree = native::merged_tree(self.tx.repo(), wc.parent_ids())?;
+        anyhow::ensure!(
+            wc.tree().tree_ids_and_labels() == parent_tree.tree_ids_and_labels(),
+            "working copy has changes; finish or set aside that work before creating a series"
+        );
+        let target = native::commit(self.tx.repo(), &self.target)?;
+        let new = native::block_on(
+            self.tx
+                .repo_mut()
+                .new_commit(vec![self.target.clone()], target.tree())
+                .set_description(message)
+                .write(),
+        )?;
+        native::set_bookmark(&mut self.tx, name, new.id());
+        self.jj.set_wc_commit(&mut self.tx, new.id())?;
+        let tx = std::mem::replace(&mut self.tx, self.jj.start());
+        match self.jj.publish(tx, "jj-fork create series")? {
+            Publication::Done(_) => {
+                report(&format!(
+                    "created {name} at {}; edit it with jj, then assemble",
+                    new.id().hex()
+                ));
+                Ok(EXIT_OK)
+            }
+            Publication::Stale(reason) => {
+                report(&format!("{reason}; no series created"));
+                Ok(EXIT_NEEDS_AGENT)
+            }
+        }
+    }
+
+    /// Removes selectors only when the reduced fork passes every check. Glue removal is explicit.
+    pub fn retire(&mut self, name: &str, remove_glue: &[String]) -> Result<i32> {
+        let suffix = self.series_suffix(name)?;
+        anyhow::ensure!(
+            self.series.iter().any(|s| s == name),
+            "no local series {name} to retire"
+        );
+        self.tip(name)?; // Refuse conflicted selectors, not an arbitrary conflict side.
+        let dependent: BTreeSet<String> = self
+            .glues
+            .iter()
+            .filter(|g| glue::names(g, &self.config.fork.glue_prefix).contains(suffix))
+            .cloned()
+            .collect();
+        let approved: BTreeSet<String> = remove_glue.iter().cloned().collect();
+        anyhow::ensure!(
+            approved.len() == remove_glue.len(),
+            "duplicate --remove-glue"
+        );
+        anyhow::ensure!(
+            approved.is_subset(&dependent),
+            "--remove-glue must name a glue depending on {name}"
+        );
+        if approved != dependent {
+            let missing = dependent
+                .difference(&approved)
+                .cloned()
+                .collect::<Vec<_>>()
+                .join(", ");
+            let message = format!(
+                "{name} has dependent glues: {missing}; review their resolutions and name each with --remove-glue (no removals published)"
+            );
+            report(&message);
+            self.issues.push(Issue {
+                id: format!("retirement_glues:{name}"),
+                code: "retirement_glues".into(),
+                subject: name.into(),
+                candidate: None,
+                tier: None,
+                message,
+            });
+            return self.conclude(Assembled::Refused, "retire");
+        }
+        for removed in std::iter::once(name).chain(approved.iter().map(String::as_str)) {
+            self.tx.repo_mut().set_local_bookmark_target(
+                jj_lib::ref_name::RefName::new(removed),
+                jj_lib::op_store::RefTarget::absent(),
+            );
+            report(&format!(
+                "planned retirement: {removed} (remote ref retained)"
+            ));
+        }
+        self.series.retain(|s| s != name);
+        self.glues.retain(|g| !approved.contains(g));
+        let assembled = self.assemble()?;
+        // Unlike normal assembly, retirement never publishes partial glue repair state.
+        self.conclude(
+            if matches!(assembled, Assembled::Done) {
+                Assembled::Done
+            } else {
+                Assembled::Refused
+            },
+            "retire",
+        )
+    }
+
+    fn series_suffix<'b>(&self, name: &'b str) -> Result<&'b str> {
+        let suffixes: Vec<_> = self
+            .config
+            .fork
+            .series_prefixes
+            .iter()
+            .filter_map(|p| name.strip_prefix(p.as_str()))
+            .collect();
+        anyhow::ensure!(
+            suffixes.len() == 1,
+            "{name} must use exactly one configured series prefix"
+        );
+        let suffix = suffixes[0];
+        anyhow::ensure!(
+            !suffix.is_empty() && !suffix.contains('+'),
+            "series names must be nonempty and must not contain +"
+        );
+        Ok(suffix)
+    }
+
     /// Publishes what `assembled` allows, then pushes if asked and allowed.
     fn conclude(&mut self, assembled: Assembled, command: &str) -> Result<i32> {
         self.outcome = match assembled {
@@ -826,6 +972,7 @@ impl<'a> Session<'a> {
                     .map(|r| r.commits);
                 // A merge built locally but never pushed has not been checked yet.
                 if self.options.save_plan.is_none()
+                    && self.options.context.command != "retire"
                     && (!self.options.checks
                         || remote.as_deref() == Some(std::slice::from_ref(&local)))
                 {
@@ -835,7 +982,7 @@ impl<'a> Session<'a> {
                     return Ok(Assembled::Done);
                 }
                 progress(&format!(
-                    "{branch} {} merges every series but is not on the remote yet; checking it",
+                    "{branch} {} merges every series; checking it",
                     self.short_of(&local)
                 ));
                 local

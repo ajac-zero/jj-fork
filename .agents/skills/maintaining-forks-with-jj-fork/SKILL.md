@@ -1,6 +1,6 @@
 ---
 name: maintaining-forks-with-jj-fork
-description: Maintains a long-lived fork as jj series (patch/*, tooling/*) plus glue/* merges on top of upstream with the jj-fork CLI. Use when asked to sync a fork with upstream, check or rebase patches, resolve a conflicted or broken series or glue, assemble or push fork/main, or run the scheduled fork-owner routine.
+description: Maintains a long-lived fork as jj series (patch/*, tooling/*) plus glue/* merges on top of upstream with the jj-fork CLI. Use when asked to create or retire a series, sync a fork with upstream, check or rebase patches, resolve a conflicted or broken series or glue, assemble or push fork/main, or run the scheduled fork-owner routine.
 ---
 
 # Maintaining a fork with jj-fork
@@ -76,14 +76,26 @@ Glue conflict after a restack: repair the `glue-conflict` issue (one authorized 
 3. `jj fork repair submit <dirs> --save-plan N`, then `jj fork apply N --push`. Resolve any remaining glue issue the same way and repeat.
 4. Fixers never publish, push, or touch `fork/main`, `main`, glues, or other series.
 
-## Changing the fork's series by hand
+## Creating, editing, and retiring series
 
-jj-fork does not create, retire, or rename series. Do it with jj, then assemble:
+Use full bookmark names under the repository's configured `fork.series_prefixes` (`patch/` by default; configure `tooling/` if needed).
 
-- New patch: `jj new 'main@upstream'`, edit, `jj bookmark create patch/<name> -r @`.
+- New patch: `jj fork create patch/<name> -m 'Describe the patch'`. This creates an empty editable commit directly on upstream, selects it as the working copy, and does not assemble or push. It refuses unfinished working-copy changes, invalid names, `+`, or a suffix already used under any configured series prefix locally or on a known remote.
 - Fix a patch: `jj new patch/<name>`, edit, `jj bookmark set patch/<name> -r @`.
-- Retire an upstreamed patch: confirm it is in upstream, `jj bookmark delete patch/<name>` **and every `glue/*` naming it** (a leftover glue brings the patch back and assemble refuses a glue naming a missing series). Remote bookmarks are never deleted by jj-fork; delete them deliberately.
-- Then `jj fork assemble` (local), or `jj fork assemble --push`.
+- After editing, `jj fork assemble` (local), or `jj fork assemble --push` with permission to publish.
+- Rename and PR-head bookmark conventions remain manual jj work; jj-fork does not manage them.
+
+Before retiring a series, confirm upstream absorbed it or the owner intends to drop it; jj-fork does not infer semantic equivalence. Run `jj fork retire patch/<name>` to learn which dependent glues require explicit approval. Review each resolution before approving removal: a three-way glue can contain fixes still needed by the two remaining series.
+
+```bash
+jj fork retire patch/a --remove-glue glue/a+b --remove-glue glue/a+b+c \
+  --save-plan /tmp/retire.json --report /tmp/retire-report.json
+jj fork apply /tmp/retire.json --push   # only for a ready plan, with permission to push
+```
+
+Retirement checks the reduced fork even when its parent set is unchanged. It never skips checks, and conflict, check failure, or stale source prevents all planned removals (no partial glue repair publication). Failed retirement plans cannot use `repair start`: fix the remaining source series/glues and prepare retirement again.
+
+History and separate PR-head bookmarks survive. Even `retire --push` never deletes remote selectors or glues; it publishes the reduced fork and remaining members only. This clone retains pending local deletions, but other clones can still select the remote refs. Permanent cross-clone retirement requires coordinated, separately authorized remote deletion.
 
 The no-silent-drop guard refuses to move `fork/main` while a series/glue bookmark on the fork remote is neither merged nor deliberately deleted locally; a bookmark you never tracked counts as not deleted.
 
@@ -94,7 +106,7 @@ The no-silent-drop guard refuses to move `fork/main` while a series/glue bookmar
 - Small-RAM machines: configure `[low_memory]` in `.jj-fork.toml`; checks use `{jobs}`/`{memory_limit_mib}`.
 - Ignored upstream failures print `note: also fails on upstream, ignored`; do not "fix" them in a patch.
 - Native commands do not need the jj CLI after `init`; git and jj must be on PATH for init/aliases, worktrees, and checks.
-- Conflict-only run: `--no-checks` (not `--no-tests`) skips configured checks; it cannot be combined with `--save-plan`/`apply`.
+- Conflict-only `check`/`sync`/`assemble` run: `--no-checks` (not `--no-tests`) skips configured checks; it cannot be combined with `--save-plan`/`apply`, and retirement has no such override.
 - A full `check`/`sync` on a large Go repo takes tens of minutes (ai-gateway: ~30 min, ~3 GB, dominated by tests); a conflict-only `--no-checks` run takes about a second. Run the scheduled owner with a generous timeout.
 - `jj fork init` writes only the revset aliases (`trunk()`, `fork_patches()`, `fork_glue()`, `fork_parents()`, `fork_head()`), not command aliases like `patch-new` or `fork-log`.
-- Not provided by jj-fork (keep in the repo's own skill or scripts): PR-head bookmarks, creating or retiring series, a Ship-button prompt that turns a thread into a series, `jj patch-new`/`fork-assemble`-style aliases, and orb bootstrap beyond `jj fork init`. A stale-script check is unnecessary because jj-fork is an installed binary; pin its version in setup instead.
+- Not provided by jj-fork (keep in the repo's own skill or scripts): PR-head bookmarks, renaming series, a Ship-button prompt that turns a thread into a series, `jj patch-new`/`fork-assemble`-style aliases, and orb bootstrap beyond `jj fork init`. A stale-script check is unnecessary because jj-fork is an installed binary; pin its version in setup instead.

@@ -389,6 +389,121 @@ unchanged_candidate_stale() {
   fi
 }
 
+series_create() {
+  fixture series-create
+  sed -i '/mirror_branch =/a series_prefixes = ["patch/", "tooling/"]' "$d/config.toml"
+  advance_upstream
+  old_fork="$(rev fork/main)"
+  expect_code 0 invoke create tooling/new -m 'fork-only work'
+  created="$(rev tooling/new)"
+  target="$(jj --ignore-working-copy log --no-graph -r 'main@upstream' -T commit_id)"
+  equal "$(git show -s --format=%P "$created")" "$target" 'create used fork as parent'
+  equal "$(git rev-parse "$created^{tree}")" "$(git rev-parse "$target^{tree}")" 'new series is not empty'
+  equal "$(jj --ignore-working-copy log --no-graph -r @ -T commit_id)" "$created" 'create did not select editable series'
+  equal "$(git show -s --format=%s "$created")" 'fork-only work' 'create description'
+  equal "$(rev fork/main)" "$old_fork" 'create assembled the fork'
+  equal "$(remote_refs)" "$remote_before" 'create pushed'
+  current="$(git for-each-ref refs/heads)"
+  for name in tooling/new patch/new patch/x+y glue/x patch/ patch/bad..name; do
+    expect_code 1 invoke create "$name" -m invalid
+    equal "$(git for-each-ref refs/heads)" "$current" 'invalid create moved bookmarks'
+  done
+  # Reserve a suffix only on upstream: checking local selectors alone misses this collision.
+  git -C "$d/upstream.git" update-ref refs/heads/patch/remote-only main
+  expect_code 1 invoke create tooling/remote-only -m invalid
+  equal "$(git for-each-ref refs/heads)" "$current" 'remote-only duplicate created a series'
+  grep -q 'already reserved' "$d/stderr" || fail 'remote-only suffix collision was not detected'
+  printf 'unfinished\n' >unfinished.txt
+  expect_code 1 invoke create patch/unfinished -m unfinished
+  equal "$(cat unfinished.txt)" unfinished 'create discarded unfinished work'
+  [[ -z "$(jj --ignore-working-copy bookmark list patch/unfinished -T 'if(!remote && present, name)')" ]] || fail 'create accepted dirty working copy'
+}
+
+series_retire() {
+  fixture series-retire
+  old_a="$(rev patch/a)"; old_b="$(rev patch/b)"
+  jj bookmark create --quiet legacy-pr -r 'bookmarks(exact:"patch/a")'
+  expect_code 0 invoke retire patch/a --push
+  [[ -z "$(jj --ignore-working-copy bookmark list patch/a -T 'if(!remote && present, name)')" ]] || fail 'retired selector still exists'
+  equal "$(rev legacy-pr)" "$old_a" 'retire moved PR head'
+  equal "$(rev patch/b)" "$old_b" 'retire moved independent series'
+  equal "$(git -C "$d/fork.git" rev-parse patch/a)" "$old_a" 'retire deleted remote series'
+  git -C "$d/fork.git" cat-file -e fork/main:a.txt 2>/dev/null && fail 'retired feature still merged'
+  equal "$(git -C "$d/fork.git" show fork/main:b.txt)" b 'remaining feature lost'
+  git cat-file -e "$old_a:a2.txt" || fail 'retire erased commit history'
+  expect_code 0 invoke assemble
+  [[ -z "$(jj --ignore-working-copy bookmark list patch/a -T 'if(!remote && present, name)')" ]] || fail 'next preparation resurrected retirement'
+}
+
+retire_glue_approval() {
+  fixture retire-glues
+  add_glue
+  old_glue="$(rev glue/a+b)"; old_a="$(rev patch/a)"
+  current="$(git for-each-ref refs/heads)"; remote="$(remote_refs)"
+  expect_code 20 invoke retire patch/a
+  grep -q 'glue/a+b' "$d/stdout" || fail 'retire did not name dependent glue'
+  equal "$(git for-each-ref refs/heads)" "$current" 'unapproved glue removal published'
+  expect_code 1 invoke retire patch/a --remove-glue glue/unrelated
+  equal "$(git for-each-ref refs/heads)" "$current" 'unrelated glue removal accepted'
+  config true false
+  expect_code 20 invoke retire patch/a --remove-glue glue/a+b --push
+  equal "$(git for-each-ref refs/heads)" "$current" 'failed fork check published removals'
+  equal "$(remote_refs)" "$remote" 'failed retirement pushed'
+  config true 'printf "%s\n" "$(git rev-parse HEAD)" > "'$d'/retirement-checked"'
+  expect_code 0 invoke retire patch/a --remove-glue glue/a+b --save-plan "$d/retire.json" --report "$d/retire-report.json"
+  equal "$(git for-each-ref refs/heads)" "$current" 'saving retirement published'
+  jq -e '.payload.context.command == "retire" and .payload.outcome == "ready"' "$d/retire.json" >/dev/null
+  candidate="$(cat "$d/retirement-checked")"
+  expect_code 0 "$bin" apply "$d/retire.json" --push
+  equal "$(rev fork/main)" "$candidate" 'retirement applied different candidate'
+  [[ -z "$(jj --ignore-working-copy bookmark list glue/a+b -T 'if(!remote && present, name)')" ]] || fail 'approved glue not retired'
+  equal "$(git -C "$d/fork.git" rev-parse glue/a+b)" "$old_glue" 'retire deleted remote glue'
+  equal "$(git -C "$d/fork.git" rev-parse patch/a)" "$old_a" 'retire deleted remote series'
+}
+
+retire_stale_source() {
+  fixture retire-stale
+  jj new --quiet 'bookmarks(exact:"fork/main")'
+  current="$(git for-each-ref refs/heads)"
+  config true 'printf "concurrent edit\n" > "'$d'/work/base.txt"'
+  expect_code 20 invoke retire patch/a --push
+  equal "$(git for-each-ref refs/heads)" "$current" 'stale retirement published removals'
+  equal "$(cat base.txt)" 'concurrent edit' 'retire discarded concurrent work'
+  equal "$(remote_refs)" "$remote_before" 'stale retirement pushed'
+}
+
+retire_unchanged_fork_checks() {
+  fixture retire-unchanged
+  # Removing an obsolete alias does not change the reduced parent set. Retirement must
+  # nevertheless run the checks, not use assembly's already-published fast path.
+  jj bookmark create --quiet patch/old -r 'bookmarks(exact:"patch/a")'
+  jj git push --quiet --remote origin -b patch/old
+  current="$(git for-each-ref refs/heads)"
+  config true false
+  expect_code 20 invoke retire patch/old
+  equal "$(git for-each-ref refs/heads)" "$current" 'retirement skipped unchanged-fork checks'
+}
+
+retire_exposes_conflict() {
+  fixture retire-conflict
+  jj new --quiet main -m 'c conflicts with b'
+  printf 'c\n' >b.txt
+  jj bookmark create --quiet patch/c -r @
+  jj new --quiet 'bookmarks(exact:"patch/a")' 'bookmarks(exact:"patch/b")' 'bookmarks(exact:"patch/c")' -m 'three-way resolution'
+  printf 'b and c\n' >b.txt
+  jj bookmark create --quiet glue/a+b+c -r @
+  expect_code 0 invoke assemble --push
+  current="$(git for-each-ref refs/heads)"; remote="$(remote_refs)"
+  expect_code 20 invoke retire patch/a --remove-glue glue/a+b+c --save-plan "$d/retire.json"
+  equal "$(git for-each-ref refs/heads)" "$current" 'conflicted retirement published removals'
+  equal "$(remote_refs)" "$remote" 'conflicted retirement pushed'
+  jq -e '.payload.outcome == "refused" and (.payload.issues | any(.code == "glue-needed"))' "$d/retire.json" >/dev/null
+  expect_code 20 "$bin" apply "$d/retire.json"
+  expect_code 1 invoke repair start "$d/retire.json" --issue glue-needed:glue/b+c --dir "$d/task"
+  grep -q 'retirement plans cannot be repaired' "$d/stderr" || fail 'retirement repair would resurrect removed selectors'
+  equal "$(git for-each-ref refs/heads)" "$current" 'not-ready retirement changed source'
+}
+
 passed=0; failed=0
 run_case() {
   local name="$1"; shift
@@ -420,5 +535,11 @@ run_case unexplained-merge-repair unexplained_repair
 run_case nested-glue-ordering nested_glues
 run_case initialized-native-commands initialized_native_commands
 for kind in operation source; do run_case "unchanged-candidate-stale-$kind" unchanged_candidate_stale "$kind"; done
+run_case series-create series_create
+run_case series-retire series_retire
+run_case retire-glue-approval-and-saved-plan retire_glue_approval
+run_case retire-stale-source retire_stale_source
+run_case retire-unchanged-fork-checks retire_unchanged_fork_checks
+run_case retire-exposes-conflict retire_exposes_conflict
 echo "$passed passed; $failed failed"
 [[ $failed == 0 ]]
