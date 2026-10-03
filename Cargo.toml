@@ -1,6 +1,6 @@
 [package]
 name = "jj-fork"
-version = "0.2.0"
+version = "0.2.1"
 edition = "2024"
 rust-version = "1.89"
 description = "Maintain a fork as jj series and glues on top of upstream, and keep them current"
@@ -25,6 +25,9 @@ serde_json = "1.0.151"
 sha2 = "0.11.0"
 tempfile = "3.27.0"
 toml = "1.1.6"
+
+# jj-cli 0.43.0 calls Builder::enable_io, which tokio only provides on Windows with `net`.
+tokio = { version = "1", default-features = false, features = ["net"] }
 
 [package.metadata.binstall]
 pkg-url = "{ repo }/releases/download/v{ version }/{ name }-v{ version }-{ target }{ archive-suffix }"

@@ -35,6 +35,12 @@ jobs:
       - run: bash tests/workflow.sh
       - run: bash tests/repair.sh
 
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v7
+      - run: cargo build --locked --release
+
   msrv:
     runs-on: ubuntu-latest
     steps:
