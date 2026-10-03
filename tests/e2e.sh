@@ -287,12 +287,10 @@ git -C "$fk" cat-file -e fork/main:newlocal.txt || fail "new local series not me
 ok "new and ahead local series are kept and pushed"
 
 # Scenario 7: a stale clone must not drop series it does not know about. Someone else pushes
-
-# Scenario 7: a stale clone must not drop series it does not know about. Someone else pushes
-# patch/theirs. jj-fork normally tracks it before assembling; when this clone cannot (simulated
-# by a jj wrapper that fails `bookmark track`), the remote series is untracked and has no local
-# bookmark, so assemble and assemble --push refuse and name it. Deleting a series on purpose
-# in this clone still works.
+# patch/theirs. It is deliberately untracked here, then native preparation must track and
+# include it. A jj subprocess failure can no longer simulate native tracking failure;
+# guard classification is covered separately by engine tests. A deliberately deleted
+# tracked series must stay deleted rather than being recreated by tracking.
 git clone -q "$root/fork.git" "$root/stale"
 cd "$root/stale"
 git checkout -q fork/main
@@ -303,29 +301,12 @@ git -C "$root/editor" checkout -q -B patch/theirs origin/main
 printf 'theirs\n' >"$root/editor/theirs.txt"
 git -C "$root/editor" add -A && git -C "$root/editor" commit -qm "patch theirs"
 git -C "$root/editor" push -q origin patch/theirs
-before="$(git -C "$root/fork.git" for-each-ref)"
 git fetch -q origin
 jj bookmark delete --quiet patch/theirs 2>/dev/null || true
 jj bookmark untrack --quiet patch/theirs --remote origin
-mkdir "$root/nobin"
-printf '#!/usr/bin/env bash\n[[ "${1:-}" == bookmark && "${2:-}" == track ]] && exit 1\nexec %s "$@"\n' "$(command -v jj)" >"$root/nobin/jj"
-chmod +x "$root/nobin/jj"
-untracking="env PATH=$root/nobin:$PATH"
-expect_code 20 $untracking "$bin" --config "$root/config.toml" assemble --no-fetch --no-checks --push
-contains "$out" "nothing pushed"
-contains "$out" "  patch/theirs"
-[[ "$(git -C "$root/fork.git" for-each-ref)" == "$before" ]] || fail "refused push still changed the remote"
-jj new --quiet "main@upstream" -m "tooling: stale local"
-printf 'stale\n' >stale.txt
-jj bookmark create --quiet tooling/stale -r @
-expect_code 20 $untracking "$bin" --config "$root/config.toml" assemble --no-fetch --no-checks
-contains "$out" "fork/main not moved"
-contains "$out" "  patch/theirs"
-jj bookmark forget --quiet tooling/stale
-ok "assemble and assemble --push refuse a remote series that is neither merged nor deleted, and name it"
-
 expect_code 0 "$bin" --config "$root/config.toml" assemble --no-fetch --push
 git -C "$root/fork.git" cat-file -e fork/main:theirs.txt || fail "tracked series not merged"
+ok "native preparation tracks and includes an untracked remote series"
 jj bookmark delete --quiet patch/theirs
 expect_code 0 "$bin" --config "$root/config.toml" assemble --no-fetch --push
 [[ -z "$(jj bookmark list --color=never patch/theirs -T 'if(!remote && present, name)')" ]] || fail "deleted series came back locally"

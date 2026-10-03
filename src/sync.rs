@@ -14,6 +14,7 @@
 //! command intends: a refusal publishes nothing it planned.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::path::PathBuf;
 
 use anyhow::{Context, Result};
 use globset::GlobSet;
@@ -27,6 +28,9 @@ use crate::checks::{Checker, Outcome, globs};
 use crate::config::{Config, Limits};
 use crate::native::{self, Native, Publication};
 use crate::repo::Repo;
+use crate::workflow::{
+    self, CheckTarget, FrozenInputs, Issue, Mapping, Plan, PlanOutcome, Proposal,
+};
 use crate::{glue, progress, report};
 
 /// Exit codes shared by every command.
@@ -40,6 +44,9 @@ pub struct Options {
     pub fetch: bool,
     pub checks: bool,
     pub push: bool,
+    pub save_plan: Option<PathBuf>,
+    pub report_path: Option<PathBuf>,
+    pub context: workflow::Context,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -107,45 +114,34 @@ pub struct Session<'a> {
     generated: GlobSet,
     results: BTreeMap<String, SeriesResult>,
     checker: Checker<'a>,
+    frozen: FrozenInputs,
+    mappings: Vec<Mapping>,
+    check_targets: Vec<CheckTarget>,
+    issues: Vec<Issue>,
+    outcome: PlanOutcome,
+    proposal: Option<Proposal>,
+    published: Option<String>,
+    push_report: Option<native::PushReport>,
+    repaired_glues: BTreeSet<String>,
     _scratch: tempfile::TempDir,
 }
 
 impl<'a> Session<'a> {
-    /// Prepares the clone with the jj CLI, then freezes the plan.
+    /// Prepares the clone natively, then freezes concrete inputs and the maintenance plan.
     pub fn new(repo: &'a Repo, config: &'a Config, options: Options) -> Result<Session<'a>> {
-        native::check_cli(&repo.root)?;
         if repo.is_shallow()? {
             progress("shallow clone detected; running init");
             crate::init::init(repo, config)?;
         }
-        repo.jj(&["util", "snapshot"])?;
-        let fork = &config.fork.remote;
-        if options.fetch {
-            progress(&format!("fetching {fork} and {}", config.upstream.remote));
-            repo.jj(&["git", "fetch", "--remote", fork, "--quiet"])?;
-            repo.jj(&[
-                "git",
-                "fetch",
-                "--remote",
-                &config.upstream.remote,
-                "--quiet",
-            ])?;
-        }
-        // Stale local bookmarks must not win over the remote, so settle them before tracking.
-        crate::reconcile::reconcile(repo, config)?;
-        // Series and glues that others pushed become local bookmarks, so the merge includes them.
-        crate::init::track(repo, config);
+        let jj = Native::prepare(repo, config, options.fetch)?;
         // Revisions are resolved once, here; nothing is re-resolved after checks begin.
-        let target = repo.rev(options.target.as_deref().unwrap_or(&config.upstream_ref()))?;
+        let target =
+            jj.resolve_single(options.target.as_deref().unwrap_or(&config.upstream_ref()))?;
         let candidate = options
             .candidate
             .as_deref()
-            .map(|c| repo.rev(c))
+            .map(|c| jj.resolve_single(c))
             .transpose()?;
-
-        let jj = Native::load(&repo.root)?;
-        let target = native::parse_id(&target)?;
-        let candidate = candidate.as_deref().map(native::parse_id).transpose()?;
         for id in std::iter::once(&target).chain(&candidate) {
             native::commit(jj.repo.as_ref(), id)
                 .with_context(|| format!("{} changed while jj-fork prepared", short(&id.hex())))?;
@@ -174,6 +170,14 @@ impl<'a> Session<'a> {
             scratch.path().to_path_buf(),
             log_dir,
         );
+        let frozen = FrozenInputs::capture(
+            repo,
+            &jj,
+            config,
+            &options.context,
+            &target,
+            candidate.as_ref(),
+        )?;
         Ok(Session {
             repo,
             config,
@@ -188,6 +192,15 @@ impl<'a> Session<'a> {
             generated,
             results: BTreeMap::new(),
             checker,
+            frozen,
+            mappings: Vec::new(),
+            check_targets: Vec::new(),
+            issues: Vec::new(),
+            outcome: PlanOutcome::Ready,
+            proposal: None,
+            published: None,
+            push_report: None,
+            repaired_glues: BTreeSet::new(),
             _scratch: scratch,
         })
     }
@@ -225,7 +238,25 @@ impl<'a> Session<'a> {
             report(&line);
             stale |= result.status != Status::UpToDate;
             needs_agent |= matches!(result.status, Status::Conflict | Status::Broken);
+            if matches!(result.status, Status::Conflict | Status::Broken) {
+                let code = if result.status == Status::Conflict {
+                    "series-conflict"
+                } else {
+                    "series-check"
+                };
+                self.issues.push(Issue {
+                    id: format!("{code}:{name}"),
+                    code: code.into(),
+                    subject: name.clone(),
+                    candidate: result.candidate.as_ref().map(|id| id.hex()),
+                    tier: result.tier.clone(),
+                    message: result.detail.clone().unwrap_or_default(),
+                });
+            }
             self.results.insert(name, result);
+        }
+        if needs_agent {
+            self.outcome = PlanOutcome::Repair;
         }
         Ok(if needs_agent {
             EXIT_NEEDS_AGENT
@@ -259,6 +290,39 @@ impl<'a> Session<'a> {
 
     /// Publishes what `assembled` allows, then pushes if asked and allowed.
     fn conclude(&mut self, assembled: Assembled, command: &str) -> Result<i32> {
+        self.outcome = match assembled {
+            Assembled::Done => PlanOutcome::Ready,
+            Assembled::Repair => PlanOutcome::Repair,
+            Assembled::Refused => PlanOutcome::Refused,
+        };
+        if self.options.save_plan.is_some() {
+            let validation = (|| -> Result<()> {
+                let mut fresh = Native::load(&self.repo.root)?;
+                let config =
+                    Config::load(&self.repo.root, Some(&self.options.context.config_path))?;
+                self.frozen
+                    .revalidate(self.repo, &mut fresh, &config, &self.options.context)?;
+                workflow::probe_remotes(&fresh, &config, &self.frozen.view)
+            })();
+            if let Err(error) = validation {
+                self.outcome = PlanOutcome::Refused;
+                self.issues.push(Issue {
+                    id: format!("stale_source:{command}"),
+                    code: "stale_source".into(),
+                    subject: command.into(),
+                    candidate: None,
+                    tier: None,
+                    message: format!("{error:#}"),
+                });
+            }
+            self.capture_proposal()?;
+            report("saved proposal only; no planned maintenance published or pushed");
+            return Ok(if self.outcome == PlanOutcome::Ready {
+                EXIT_OK
+            } else {
+                EXIT_NEEDS_AGENT
+            });
+        }
         let code = match assembled {
             Assembled::Refused => {
                 report("no planned maintenance published; no bookmarks moved");
@@ -267,14 +331,41 @@ impl<'a> Session<'a> {
             Assembled::Repair => EXIT_NEEDS_AGENT,
             Assembled::Done => EXIT_OK,
         };
+        if self.options.report_path.is_some() {
+            self.capture_proposal()?;
+            self.write_artifacts(code)?;
+        }
         let tx = std::mem::replace(&mut self.tx, self.jj.start());
         let changed = tx.repo().has_changes();
-        match self.jj.publish(tx, &format!("jj-fork {command}"))? {
+        let publication = if let Some(proposal) = &self.proposal {
+            let op =
+                jj_lib::op_store::OperationId::try_from_hex(proposal.operation.as_deref().unwrap())
+                    .context("invalid prepared operation id")?;
+            self.jj.publish_prepared(
+                self.jj.load_prepared_operation(&op)?,
+                &format!("jj-fork {command}"),
+            )
+        } else {
+            self.jj.publish(tx, &format!("jj-fork {command}"))
+        };
+        match publication? {
             Publication::Done(op) if changed => {
+                self.published = Some(op.hex());
                 progress(&format!("published operation {}", short(&op.hex())));
             }
-            Publication::Done(_) => {}
+            Publication::Done(op) => {
+                self.published = Some(op.hex());
+            }
             Publication::Stale(reason) => {
+                self.outcome = PlanOutcome::Refused;
+                self.issues.push(Issue {
+                    id: format!("stale_source:{command}"),
+                    code: "stale_source".into(),
+                    subject: command.into(),
+                    candidate: None,
+                    tier: None,
+                    message: reason.clone(),
+                });
                 report(&format!(
                     "{reason} while jj-fork ran; no planned maintenance published. Rerun."
                 ));
@@ -313,6 +404,14 @@ impl<'a> Session<'a> {
             }
         }
         let copies = native::duplicate(&mut self.tx, &commits, std::slice::from_ref(&self.target))?;
+        for original in commits.iter().rev() {
+            self.mappings.push(Mapping {
+                original: original.hex(),
+                copy: copies[original].id().hex(),
+                subject: name.into(),
+            });
+        }
+        let candidate = copies[&tip].id().clone();
         // Parents first, so the first conflicted copy is where the replay first conflicts.
         for (i, id) in commits.iter().rev().enumerate() {
             let copy = &copies[id];
@@ -341,13 +440,16 @@ impl<'a> Session<'a> {
                 size.files.len(),
                 size.files.join(","),
             );
-            return Ok(SeriesResult::new(
-                Status::Conflict,
-                Some(tier),
-                Some(detail),
-            ));
+            return Ok(SeriesResult {
+                candidate: Some(candidate),
+                ..SeriesResult::new(Status::Conflict, Some(tier), Some(detail))
+            });
         }
-        let candidate = copies[&tip].id().clone();
+        self.check_targets.push(CheckTarget {
+            subject: name.into(),
+            candidate: candidate.hex(),
+            patch: true,
+        });
         if self.options.checks {
             progress(&format!(
                 "checking {name} on {}",
@@ -362,14 +464,17 @@ impl<'a> Session<'a> {
             if let Outcome::Fail { check, tier, log } =
                 self.checker.run(&worktree.path, &checks, true, name)?
             {
-                return Ok(SeriesResult::new(
-                    Status::Broken,
-                    Some(&tier),
-                    Some(format!(
-                        "replays cleanly but fails {check} checks; log: {}",
-                        log.display()
-                    )),
-                ));
+                return Ok(SeriesResult {
+                    candidate: Some(candidate),
+                    ..SeriesResult::new(
+                        Status::Broken,
+                        Some(&tier),
+                        Some(format!(
+                            "replays cleanly but fails {check} checks; log: {}",
+                            log.display()
+                        )),
+                    )
+                });
             }
         }
         Ok(SeriesResult {
@@ -383,6 +488,7 @@ impl<'a> Session<'a> {
         let moves: Vec<(String, CommitId)> = self
             .results
             .iter()
+            .filter(|(_, r)| r.status == Status::Clean)
             .filter_map(|(name, r)| r.candidate.clone().map(|c| (name.clone(), c)))
             .collect();
         for (name, candidate) in moves {
@@ -432,6 +538,14 @@ impl<'a> Session<'a> {
                 Ok(parents) => parents,
                 Err(reason) => {
                     report(&format!("glue invalid — {reason}"));
+                    self.issues.push(Issue {
+                        id: format!("invalid_glue:{name}"),
+                        code: "invalid_glue".into(),
+                        subject: name.clone(),
+                        candidate: None,
+                        tier: None,
+                        message: reason,
+                    });
                     invalid = true;
                     continue;
                 }
@@ -439,10 +553,19 @@ impl<'a> Session<'a> {
             let tip = self.tip(name)?;
             let mut parents = native::commit(self.tx.repo(), &tip)?.parent_ids().to_vec();
             parents.sort();
+            anyhow::ensure!(
+                !self.repaired_glues.contains(name) || parents == expected,
+                "repaired glue {name} no longer has its exact required parents"
+            );
             if parents != expected {
                 let copies =
                     native::duplicate(&mut self.tx, std::slice::from_ref(&tip), &expected)?;
                 let new = copies[&tip].id().clone();
+                self.mappings.push(Mapping {
+                    original: tip.hex(),
+                    copy: new.hex(),
+                    subject: name.clone(),
+                });
                 native::set_bookmark(&mut self.tx, name, &new);
                 report(&format!("{name} -> {} (restacked)", self.short_of(&new)));
             }
@@ -450,6 +573,14 @@ impl<'a> Session<'a> {
             let tree = native::commit(self.tx.repo(), &tip)?.tree();
             if tree.has_conflict() {
                 let files = native::conflicted_paths(&tree)?;
+                self.issues.push(Issue {
+                    id: format!("glue-conflict:{name}"),
+                    code: "glue-conflict".into(),
+                    subject: name.clone(),
+                    candidate: Some(tip.hex()),
+                    tier: Some(conflict_files_tier(files.len()).into()),
+                    message: "restacked glue has conflicts".into(),
+                });
                 report(&format!(
                     "glue conflict [tier={}] — {name} at {} has conflicts:",
                     conflict_files_tier(files.len()),
@@ -493,7 +624,7 @@ impl<'a> Session<'a> {
     /// Each pair of merge parents that conflicts on its own under jj's merge, with the glue that
     /// would resolve it. Pairs are ordered by name, within and across pairs, so reports do not
     /// depend on commit ids and the first pair an agent is told to glue is the same on every run.
-    fn conflicting_pairs(&self, parents: &[CommitId]) -> Result<Vec<String>> {
+    fn conflicting_pairs(&self, parents: &[CommitId]) -> Result<Vec<(String, String, String)>> {
         let fork = &self.config.fork;
         let mut prefixes = fork.series_prefixes.clone();
         prefixes.push(fork.glue_prefix.clone());
@@ -520,11 +651,7 @@ impl<'a> Session<'a> {
                 )?;
                 if tree.has_conflict() {
                     let glue = glue::suggested(a, b, &fork.glue_prefix, &fork.series_prefixes);
-                    pairs.push(format!(
-                        "{a} + {b}: add {glue} with: jj new '{}' '{}'",
-                        Repo::bookmark_revset(a),
-                        Repo::bookmark_revset(b)
-                    ));
+                    pairs.push((a.clone(), b.clone(), glue));
                 }
             }
         }
@@ -555,6 +682,24 @@ impl<'a> Session<'a> {
             report(&format!("  {}    {}-sided conflict", file.path, file.sides));
         }
         let pairs = self.conflicting_pairs(parents)?;
+        let saved_conflict = if existing.is_none()
+            && (self.options.save_plan.is_some() || self.options.report_path.is_some())
+            && !pairs.is_empty()
+        {
+            Some(
+                native::block_on(
+                    self.tx
+                        .repo_mut()
+                        .new_commit(parents.to_vec(), tree.clone())
+                        .set_description(&self.config.fork.merge_message)
+                        .write(),
+                )?
+                .id()
+                .hex(),
+            )
+        } else {
+            existing.map(|id| id.hex())
+        };
         if pairs.is_empty() {
             let repair = match existing {
                 Some(id) => native::commit(self.tx.repo(), id)?,
@@ -570,13 +715,34 @@ impl<'a> Session<'a> {
                     commit
                 }
             };
+            self.issues.push(Issue {
+                id: format!("fork-conflict:{branch}"),
+                code: "fork-conflict".into(),
+                subject: branch.clone(),
+                candidate: Some(repair.id().hex()),
+                tier: Some(conflict_files_tier(files.len()).into()),
+                message: "fork merge has conflicts between series without a conflicting pair"
+                    .into(),
+            });
             report(&format!(
                 "no single pair conflicts; resolve the merge in that commit, then run: jj fork assemble --candidate {} --push",
                 native::short_change(&repair)
             ));
         } else {
-            for pair in &pairs {
-                report(&format!("  conflicting pair: {pair}"));
+            for (a, b, glue) in &pairs {
+                self.issues.push(Issue {
+                    id: format!("glue-needed:{glue}"),
+                    code: "glue-needed".into(),
+                    subject: glue.clone(),
+                    candidate: saved_conflict.clone(),
+                    tier: Some(conflict_files_tier(files.len()).into()),
+                    message: format!("add {glue} to resolve {a} + {b}"),
+                });
+                report(&format!(
+                    "  conflicting pair: {a} + {b}: add {glue} with: jj new '{}' '{}'",
+                    Repo::bookmark_revset(a),
+                    Repo::bookmark_revset(b)
+                ));
             }
             report(
                 "add the first pair's glue: run its jj new command, resolve the conflicts, and create the named",
@@ -598,6 +764,14 @@ impl<'a> Session<'a> {
             ));
             for line in &nested {
                 report(&format!("  {line}"));
+                self.issues.push(Issue {
+                    id: format!("nested_series:{line}"),
+                    code: "nested_series".into(),
+                    subject: branch.clone(),
+                    candidate: None,
+                    tier: None,
+                    message: line.clone(),
+                });
             }
             report(
                 "if the inner one is obsolete (renamed or merged), delete it: jj bookmark delete <name>",
@@ -629,6 +803,14 @@ impl<'a> Session<'a> {
                     .to_vec();
                 ids.sort();
                 if ids != parents {
+                    self.issues.push(Issue {
+                        id: format!("candidate_membership:{branch}"),
+                        code: "candidate_membership".into(),
+                        subject: branch.clone(),
+                        candidate: Some(candidate.hex()),
+                        tier: None,
+                        message: "candidate does not merge exactly the resolved members".into(),
+                    });
                     report(&format!(
                         "candidate {} does not merge exactly the upstream target, every series, and every glue",
                         self.short_of(&candidate)
@@ -643,7 +825,10 @@ impl<'a> Session<'a> {
                     .find(|r| r.name == branch)
                     .map(|r| r.commits);
                 // A merge built locally but never pushed has not been checked yet.
-                if !self.options.checks || remote.as_deref() == Some(std::slice::from_ref(&local)) {
+                if self.options.save_plan.is_none()
+                    && (!self.options.checks
+                        || remote.as_deref() == Some(std::slice::from_ref(&local)))
+                {
                     report(&format!(
                         "{branch} already merges upstream and every series"
                     ));
@@ -674,6 +859,11 @@ impl<'a> Session<'a> {
         if tree.has_conflict() {
             return self.report_conflicted_merge(Some(&merge), &tree, &parents);
         }
+        self.check_targets.push(CheckTarget {
+            subject: branch.clone(),
+            candidate: merge.hex(),
+            patch: false,
+        });
         if self.options.checks {
             progress(&format!(
                 "checking {branch} candidate {}",
@@ -683,10 +873,22 @@ impl<'a> Session<'a> {
                 self.repo
                     .worktree(&self.checker.scratch, "fork-candidate", &merge.hex())?;
             let checks = self.config.checks.fork.clone();
-            if let Outcome::Fail { check, log, .. } =
-                self.checker
-                    .run(&worktree.path, &checks, false, "fork-branch")?
-            {
+            let first_record = self.checker.records.len();
+            let checked = self
+                .checker
+                .run(&worktree.path, &checks, false, "fork-branch")?;
+            for record in &mut self.checker.records[first_record..] {
+                record.subject.clone_from(&branch);
+            }
+            if let Outcome::Fail { check, tier, log } = checked {
+                self.issues.push(Issue {
+                    id: format!("fork-check:{branch}"),
+                    code: "fork-check".into(),
+                    subject: branch.clone(),
+                    candidate: Some(merge.hex()),
+                    tier: Some(tier),
+                    message: format!("fails {check} checks; log: {}", log.display()),
+                });
                 report(&format!(
                     "{branch} candidate {} fails {check} checks; {branch} not moved; log: {}",
                     self.short_of(&merge),
@@ -697,6 +899,16 @@ impl<'a> Session<'a> {
         }
         let dropped = dropped_from(self.tx.repo(), self.config, &merge)?;
         if !dropped.is_empty() {
+            for name in &dropped {
+                self.issues.push(Issue {
+                    id: format!("remote_membership:{name}"),
+                    code: "remote_membership".into(),
+                    subject: name.clone(),
+                    candidate: Some(merge.hex()),
+                    tier: None,
+                    message: "remote bookmark is neither merged nor deliberately deleted".into(),
+                });
+            }
             report_dropped(self.config, &dropped);
             return Ok(Assembled::Refused);
         }
@@ -720,103 +932,20 @@ impl<'a> Session<'a> {
         Ok(Assembled::Done)
     }
 
-    /// Publishes the mirror branch, every series and glue, and the fork branch with the pinned
-    /// CLI, from the operation jj-fork last published (or froze), so the pushed targets and the
-    /// remote positions they replace are the validated ones. Another run may have pushed while
-    /// this one was checking, so it fetches again first and refuses if any relevant ref on the
-    /// remote changed since the freeze, or if a bookmark to push changed locally.
+    /// Push only exact locally published targets with native explicit remote leases.
     fn push(&mut self) -> Result<i32> {
-        let remote = self.config.fork.remote.clone();
-        let anchor = self.jj.repo.clone();
-        self.repo
-            .jj(&["git", "fetch", "--remote", &remote, "--quiet"])?;
-        let now = self.jj.load_head()?;
-        let changed = changed_names(&self.remote_snapshot, &fork_refs(now.as_ref(), self.config));
-        if !changed.is_empty() {
-            report(&format!(
-                "{remote} changed while jj-fork ran; nothing pushed. Changed on {remote}:"
-            ));
-            for name in &changed {
-                report(&format!("  {name}"));
-            }
-            report("rerun: jj fork assemble --push");
-            return Ok(EXIT_NEEDS_AGENT);
-        }
-        let branch = self.config.fork.branch.clone();
-        let mut bookmarks = vec![branch.clone()];
-        bookmarks.extend(self.series.iter().chain(&self.glues).cloned());
-        bookmarks.extend(self.config.fork.mirror_branch.clone());
-        let mut targets = BTreeMap::new();
-        for name in &bookmarks {
-            let intended = native::bookmark(anchor.as_ref(), name)?;
-            if native::bookmark(now.as_ref(), name)? != intended {
-                report(&format!(
-                    "{name} changed locally while jj-fork ran; nothing pushed. Rerun: jj fork assemble --push"
-                ));
-                return Ok(EXIT_NEEDS_AGENT);
-            }
-            targets.insert(name.clone(), intended);
-        }
-        let Some(fork_tip) = targets[&branch].clone() else {
-            report(&format!("{branch} does not exist locally; nothing pushed"));
-            return Ok(EXIT_NEEDS_AGENT);
-        };
-        let dropped = dropped_from(now.as_ref(), self.config, &fork_tip)?;
-        if !dropped.is_empty() {
-            report_dropped(self.config, &dropped);
-            report("nothing pushed");
-            return Ok(EXIT_NEEDS_AGENT);
-        }
-        let remote_tips: BTreeMap<String, Vec<CommitId>> =
-            native::remote_bookmarks(now.as_ref(), &remote)
-                .into_iter()
-                .map(|r| (r.name, r.commits))
-                .collect();
-        let remote_tip = |name: &str| match remote_tips.get(name).map(Vec::as_slice) {
-            Some([one]) => Some(one.clone()),
-            _ => None,
-        };
-        if let Some(mirror) = &self.config.fork.mirror_branch {
-            let fast_forward = match (remote_tip(mirror), &targets[mirror]) {
-                (Some(theirs), Some(ours)) => native::is_ancestor(now.as_ref(), &theirs, ours)?,
-                _ => false,
-            };
-            if !fast_forward {
-                bookmarks.retain(|b| b != mirror);
-            }
-        }
-        // Never push a bookmark backwards: a local commit that is a proper ancestor of the
-        // remote's would drop commits there.
-        let mut push = Vec::new();
-        for b in bookmarks {
-            let behind = match (&targets[&b], remote_tip(&b)) {
-                (Some(ours), Some(theirs)) => {
-                    *ours != theirs && native::is_ancestor(now.as_ref(), ours, &theirs)?
-                }
-                _ => false,
-            };
-            if behind {
-                report(&format!("not pushing {b}: it is behind {b}@{remote}"));
-            } else {
-                push.push(b);
-            }
-        }
-        let anchor_op = anchor.op_id().hex();
-        let mut args = vec![
-            "--at-op".to_string(),
-            anchor_op,
-            "git".into(),
-            "push".into(),
-            "--remote".into(),
-            remote.clone(),
-        ];
-        for b in &push {
-            args.extend(["-b".to_string(), b.clone()]);
-        }
-        progress(&format!("pushing {}", push.join(" ")));
-        let args: Vec<&str> = args.iter().map(String::as_str).collect();
-        crate::run::run(&self.repo.root, "jj", &args)?;
-        Ok(EXIT_OK)
+        self.push_report = push_checked(
+            &mut self.jj,
+            self.config,
+            &self.remote_snapshot,
+            &self.series,
+            &self.glues,
+        )?;
+        Ok(match &self.push_report {
+            Some(r) if r.all_accepted() => EXIT_OK,
+            Some(_) => 1,
+            None => EXIT_NEEDS_AGENT,
+        })
     }
 
     pub fn finish(&self) {
@@ -824,6 +953,512 @@ impl<'a> Session<'a> {
             report(&format!("note: also fails on upstream, ignored: {failure}"));
         }
     }
+
+    fn capture_proposal(&mut self) -> Result<()> {
+        if self.proposal.is_some() {
+            return Ok(());
+        }
+        let tx = std::mem::replace(&mut self.tx, self.jj.start());
+        let prepared =
+            native::block_on(tx.write("jj-fork: saved unpublished proposal"))?.leave_unpublished();
+        self.proposal = Some(workflow::proposal(
+            self.jj.repo.as_ref(),
+            prepared.as_ref(),
+            &self.frozen.workspace_name,
+            self.mappings.clone(),
+            self.check_targets.clone(),
+            Some(prepared.op_id().hex()),
+        )?);
+        Ok(())
+    }
+
+    pub fn record_error(&mut self, error: &anyhow::Error) {
+        self.outcome = PlanOutcome::Refused;
+        if self.jj.repo.op_id().hex() != self.frozen.base_operation {
+            self.published = Some(self.jj.repo.op_id().hex());
+        }
+        self.issues.push(Issue {
+            id: format!("engine_error:{}", self.options.context.command),
+            code: "engine_error".into(),
+            subject: self.options.context.command.clone(),
+            candidate: None,
+            tier: None,
+            message: format!("{error:#}"),
+        });
+    }
+
+    pub fn write_artifacts(&mut self, code: i32) -> Result<()> {
+        if self.options.save_plan.is_none() && self.options.report_path.is_none() {
+            return Ok(());
+        }
+        self.capture_proposal()?;
+        let plan = Plan {
+            context: self.options.context.clone(),
+            frozen: self.frozen.clone(),
+            proposal: self.proposal.clone().unwrap(),
+            outcome: self.outcome.clone(),
+            issues: self.issues.clone(),
+            checks: self.checker.records.clone(),
+        };
+        if let Some(path) = &self.options.save_plan {
+            crate::artifact::save_plan(path, self.jj.repository_path(), &plan)?;
+        }
+        if let Some(path) = &self.options.report_path {
+            crate::artifact::save_report(
+                path,
+                &workflow::Report {
+                    diagnostics: plan.issues.clone(),
+                    plan: Some(plan),
+                    exit_code: code,
+                    published_operation: self.published.clone(),
+                    push: self.push_report.clone(),
+                },
+            )?;
+        }
+        Ok(())
+    }
+}
+
+pub fn push_saved(
+    _repo: &Repo,
+    jj: &mut Native,
+    config: &Config,
+    plan: &Plan,
+) -> Result<Option<native::PushReport>> {
+    let snapshot: Vec<_> = plan
+        .frozen
+        .view
+        .remotes
+        .iter()
+        .filter(|r| {
+            r.remote == config.fork.remote
+                && !r.tag
+                && (r.name == config.fork.branch
+                    || config.fork.mirror_branch.as_deref() == Some(&r.name)
+                    || r.name.starts_with(&config.fork.glue_prefix)
+                    || config
+                        .fork
+                        .series_prefixes
+                        .iter()
+                        .any(|p| r.name.starts_with(p)))
+        })
+        .map(|r| {
+            format!(
+                "{} {}",
+                r.name,
+                r.target
+                    .terms
+                    .iter()
+                    .step_by(2)
+                    .flatten()
+                    .cloned()
+                    .collect::<Vec<_>>()
+                    .join(",")
+            )
+        })
+        .collect();
+    push_checked(
+        jj,
+        config,
+        &snapshot,
+        &plan.frozen.series,
+        &plan
+            .frozen
+            .glues
+            .iter()
+            .chain(&plan.proposal.approved_new_glues)
+            .cloned()
+            .collect::<Vec<_>>(),
+    )
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RepairKind {
+    Series,
+    Glue,
+    NewGlue,
+    Fork,
+}
+
+pub struct RepairReplacement {
+    pub issue: String,
+    pub subject: String,
+    pub kind: RepairKind,
+    /// Whole repaired series, parents first; other kinds contain exactly one commit.
+    pub commits: Vec<CommitId>,
+}
+
+/// Rebuild a successor from approved imported objects, never by preparing a different base.
+/// Task verification/import owns path scope; this boundary independently validates graph shape,
+/// change identities, named issue scope, downstream membership, and every required check.
+pub fn rebuild_repaired(
+    repo: &Repo,
+    config: &Config,
+    original: &Plan,
+    replacements: &[RepairReplacement],
+) -> Result<Plan> {
+    let prepared = workflow::load_proposal(repo, config, original)?;
+    let mut jj = Native::load(&repo.root)?;
+    original
+        .frozen
+        .revalidate(repo, &mut jj, config, &original.context)?;
+    anyhow::ensure!(
+        original.outcome != PlanOutcome::Ready && !replacements.is_empty(),
+        "repair requires a not-ready plan and at least one replacement"
+    );
+    let scratch = tempfile::Builder::new()
+        .prefix("jj-fork-rebuild.")
+        .tempdir()?;
+    let logs = std::env::temp_dir().join("jj-fork-logs").join(format!(
+        "repair-{}-{}",
+        std::process::id(),
+        rand::random::<u64>()
+    ));
+    std::fs::create_dir_all(&logs)?;
+    let checker = Checker::new(
+        repo,
+        config,
+        original.frozen.target.clone(),
+        scratch.path().into(),
+        logs,
+    );
+    let generated = globs(
+        &config
+            .generated
+            .as_ref()
+            .map(|g| g.paths.clone())
+            .unwrap_or_default(),
+    )?;
+    let mut tx = jj.start();
+    tx.repo_mut().merge_index(&prepared)?;
+    let mut session = Session {
+        repo,
+        config,
+        options: Options {
+            target: None,
+            candidate: None,
+            fetch: false,
+            checks: true,
+            push: false,
+            save_plan: None,
+            report_path: None,
+            context: original.context.clone(),
+        },
+        target: native::parse_id(&original.frozen.target)?,
+        candidate: None,
+        series: original.frozen.series.clone(),
+        glues: original
+            .frozen
+            .glues
+            .iter()
+            .chain(&original.proposal.approved_new_glues)
+            .cloned()
+            .collect(),
+        remote_snapshot: fork_refs(jj.repo.as_ref(), config),
+        jj,
+        tx,
+        generated,
+        results: BTreeMap::new(),
+        checker,
+        frozen: original.frozen.clone(),
+        mappings: original.proposal.mappings.clone(),
+        check_targets: Vec::new(),
+        issues: Vec::new(),
+        outcome: PlanOutcome::Ready,
+        proposal: None,
+        published: None,
+        push_report: None,
+        repaired_glues: BTreeSet::new(),
+        _scratch: scratch,
+    };
+    // Carry planned series and restacked glue tips, not the old proposal's conflicted graph
+    // heads/workspace. The successor graph starts at the frozen source view.
+    for name in session.series.clone() {
+        if replacements.iter().any(|r| r.subject == name) {
+            continue;
+        }
+        let tip = session
+            .mappings
+            .iter()
+            .rev()
+            .find(|m| m.subject == name)
+            .map(|m| native::parse_id(&m.copy))
+            .transpose()?;
+        if let Some(tip) = tip {
+            let commit = native::commit(session.tx.repo(), &tip)?;
+            native::block_on(session.tx.repo_mut().add_head(&commit))?;
+            native::set_bookmark(&mut session.tx, &name, &tip);
+        }
+    }
+    for name in session.glues.clone() {
+        if replacements.iter().any(|r| r.subject == name) {
+            continue;
+        }
+        if let Some(tip) = native::bookmark(prepared.as_ref(), &name)? {
+            native::set_bookmark(&mut session.tx, &name, &tip);
+        }
+    }
+    let mut subjects = BTreeSet::new();
+    let mut approved = original.proposal.approved_new_glues.clone();
+    for replacement in replacements {
+        anyhow::ensure!(
+            subjects.insert(replacement.subject.clone()),
+            "duplicate repair subject"
+        );
+        let issue = original
+            .issues
+            .iter()
+            .find(|i| i.id == replacement.issue)
+            .context("repair issue is absent from parent plan")?;
+        anyhow::ensure!(
+            issue.subject == replacement.subject,
+            "repair issue/subject mismatch"
+        );
+        let valid_kind = match replacement.kind {
+            RepairKind::Series => matches!(issue.code.as_str(), "series-conflict" | "series-check"),
+            RepairKind::Glue => issue.code == "glue-conflict",
+            RepairKind::NewGlue => issue.code == "glue-needed",
+            RepairKind::Fork => matches!(issue.code.as_str(), "fork-conflict" | "fork-check"),
+        };
+        anyhow::ensure!(
+            valid_kind && !replacement.commits.is_empty(),
+            "invalid repair kind or empty result"
+        );
+        if replacement.kind != RepairKind::Series {
+            anyhow::ensure!(
+                replacement.commits.len() == 1,
+                "non-series repair must contain one commit"
+            );
+        }
+        for id in &replacement.commits {
+            let commit = native::commit(session.tx.repo(), id)?;
+            anyhow::ensure!(
+                !commit.has_conflict(),
+                "submitted repair still contains conflicts"
+            );
+            native::block_on(session.tx.repo_mut().add_head(&commit))?;
+        }
+        let tip = replacement.commits.last().unwrap();
+        match replacement.kind {
+            RepairKind::Series => {
+                anyhow::ensure!(
+                    session.series.contains(&replacement.subject),
+                    "repair is not a frozen series"
+                );
+                let mappings: Vec<_> = session
+                    .mappings
+                    .iter_mut()
+                    .filter(|m| m.subject == replacement.subject)
+                    .collect();
+                anyhow::ensure!(
+                    mappings.len() == replacement.commits.len(),
+                    "repaired series changed commit count"
+                );
+                let mut parent = session.target.clone();
+                for (mapping, id) in mappings.into_iter().zip(&replacement.commits) {
+                    let prior =
+                        native::commit(prepared.as_ref(), &native::parse_id(&mapping.copy)?)?;
+                    let commit = native::commit(session.tx.repo(), id)?;
+                    anyhow::ensure!(
+                        commit.parent_ids() == std::slice::from_ref(&parent)
+                            && commit.change_id() == prior.change_id(),
+                        "repaired series changed parents or change identities"
+                    );
+                    mapping.copy = id.hex();
+                    parent = id.clone();
+                }
+                native::set_bookmark(&mut session.tx, &replacement.subject, tip);
+            }
+            RepairKind::Glue | RepairKind::NewGlue => {
+                if replacement.kind == RepairKind::NewGlue {
+                    anyhow::ensure!(
+                        !session.glues.contains(&replacement.subject),
+                        "new glue already exists"
+                    );
+                    session.glues.push(replacement.subject.clone());
+                    approved.push(replacement.subject.clone());
+                }
+                native::set_bookmark(&mut session.tx, &replacement.subject, tip);
+                session.repaired_glues.insert(replacement.subject.clone());
+            }
+            RepairKind::Fork => session.candidate = Some(tip.clone()),
+        }
+    }
+    // Every planned/repaired series is checked again, including one now based on the target.
+    for name in session.series.clone() {
+        if !subjects.contains(&name)
+            && !original.proposal.mappings.iter().any(|m| m.subject == name)
+        {
+            continue;
+        }
+        let tip = session.tip(&name)?;
+        let unresolved = original.issues.iter().find(|i| {
+            i.subject == name && i.code == "series-conflict" && !subjects.contains(&name)
+        });
+        if let Some(issue) = unresolved {
+            session.issues.push(issue.clone());
+            session.outcome = PlanOutcome::Repair;
+            continue;
+        }
+        session.check_targets.push(CheckTarget {
+            subject: name.clone(),
+            candidate: tip.hex(),
+            patch: true,
+        });
+        let worktree = repo.worktree(
+            &session.checker.scratch,
+            &name.replace('/', "_"),
+            &tip.hex(),
+        )?;
+        if let Outcome::Fail { check, tier, log } =
+            session
+                .checker
+                .run(&worktree.path, &config.checks.patch, true, &name)?
+        {
+            session.issues.push(Issue {
+                id: format!("series-check:{name}"),
+                code: "series-check".into(),
+                subject: name,
+                candidate: Some(tip.hex()),
+                tier: Some(tier),
+                message: format!("fails {check}; log: {}", log.display()),
+            });
+            session.outcome = PlanOutcome::Repair;
+        }
+    }
+    if session.outcome == PlanOutcome::Ready {
+        let assembled = session.assemble()?;
+        session.outcome = match assembled {
+            Assembled::Done => PlanOutcome::Ready,
+            Assembled::Repair => PlanOutcome::Repair,
+            Assembled::Refused => PlanOutcome::Refused,
+        };
+    }
+    // A glue is a single resolution, so every old-to-copy edge now points to its final
+    // resolution. Superseded conflicted copies remain in the parent plan, not Ready heads.
+    for name in session.glues.clone() {
+        let tip = session.tip(&name)?;
+        for mapping in session.mappings.iter_mut().filter(|m| m.subject == name) {
+            mapping.copy = tip.hex();
+        }
+        let commit = native::commit(session.tx.repo(), &tip)?;
+        native::block_on(session.tx.repo_mut().add_head(&commit))?;
+    }
+    let mut fresh = Native::load(&repo.root)?;
+    original
+        .frozen
+        .revalidate(repo, &mut fresh, config, &original.context)?;
+    workflow::probe_remotes(&fresh, config, &original.frozen.view)?;
+    session.capture_proposal()?;
+    let mut proposal = session.proposal.take().unwrap();
+    proposal.approved_new_glues = approved;
+    let plan = Plan {
+        context: original.context.clone(),
+        frozen: original.frozen.clone(),
+        proposal,
+        outcome: session.outcome,
+        issues: session.issues,
+        checks: session.checker.records,
+    };
+    let loaded = session.jj.load_prepared_operation(
+        &jj_lib::op_store::OperationId::try_from_hex(plan.proposal.operation.as_deref().unwrap())
+            .context("invalid prepared operation id")?,
+    )?;
+    workflow::validate_proposal(&plan, session.jj.repo.as_ref(), loaded.as_ref(), config)?;
+    Ok(plan)
+}
+
+fn push_checked(
+    jj: &mut Native,
+    config: &Config,
+    snapshot: &[String],
+    series: &[String],
+    glues: &[String],
+) -> Result<Option<native::PushReport>> {
+    let remote = &config.fork.remote;
+    let anchor = jj.repo.clone();
+    let observed = jj.probe_remote(remote)?;
+    let changed = changed_names(snapshot, &fork_refs(observed.as_ref(), config));
+    if !changed.is_empty() {
+        report(&format!(
+            "{remote} changed while jj-fork ran; nothing pushed. Changed on {remote}:"
+        ));
+        for name in &changed {
+            report(&format!("  {name}"));
+        }
+        report("rerun: jj fork assemble --push");
+        return Ok(None);
+    }
+    let now = jj.load_head()?;
+    let mut names = vec![config.fork.branch.clone()];
+    names.extend(series.iter().chain(glues).cloned());
+    names.extend(config.fork.mirror_branch.clone());
+    names.sort();
+    names.dedup();
+    let fork =
+        native::bookmark(anchor.as_ref(), &config.fork.branch)?.context("fork branch is absent")?;
+    let dropped = dropped_from(now.as_ref(), config, &fork)?;
+    if !dropped.is_empty() {
+        report_dropped(config, &dropped);
+        report("nothing pushed");
+        return Ok(None);
+    }
+    let mut updates = Vec::new();
+    for name in names {
+        let intended = native::bookmark(anchor.as_ref(), &name)?;
+        if native::bookmark(now.as_ref(), &name)? != intended {
+            report(&format!(
+                "{name} changed locally while jj-fork ran; nothing pushed"
+            ));
+            return Ok(None);
+        }
+        let Some(after) = intended else {
+            continue;
+        };
+        let remote_ref = observed
+            .view()
+            .get_remote_bookmark(jj_lib::ref_name::RemoteRefSymbol {
+                name: jj_lib::ref_name::RefName::new(&name),
+                remote: jj_lib::ref_name::RemoteName::new(remote),
+            });
+        anyhow::ensure!(
+            !remote_ref.target.has_conflict(),
+            "remote target for {name} is conflicted"
+        );
+        let before = remote_ref.target.as_normal().cloned();
+        if let Some(theirs) = &before {
+            if *theirs == after {
+                continue;
+            }
+            if native::is_ancestor(observed.as_ref(), &after, theirs)? {
+                report(&format!("not pushing {name}: it is behind {name}@{remote}"));
+                continue;
+            }
+            if config.fork.mirror_branch.as_deref() == Some(&name)
+                && !native::is_ancestor(observed.as_ref(), theirs, &after)?
+            {
+                continue;
+            }
+        }
+        updates.push(native::PushUpdate {
+            name,
+            before,
+            after,
+        });
+    }
+    progress(&format!(
+        "pushing {}",
+        updates
+            .iter()
+            .map(|u| u.name.as_str())
+            .collect::<Vec<_>>()
+            .join(" ")
+    ));
+    let result = jj.push_explicit(remote, &updates)?;
+    for line in result.lines() {
+        report(&line);
+    }
+    Ok(Some(result))
 }
 
 /// Difficulty of a merge or glue conflict from its number of conflicted files.
@@ -865,36 +1500,7 @@ fn dropped_from(
     let fork = &config.fork;
     let mut prefixes = fork.series_prefixes.clone();
     prefixes.push(fork.glue_prefix.clone());
-    let remote: Vec<_> = native::remote_bookmarks(repo, &fork.remote)
-        .into_iter()
-        .filter(|r| prefixes.iter().any(|p| r.name.starts_with(p.as_str())))
-        .collect();
-    let local = |name: &str| -> Result<Option<CommitId>> { native::bookmark(repo, name) };
-    let mut deleted = BTreeSet::new();
-    let mut merged = BTreeSet::new();
-    for r in &remote {
-        let mine = local(&r.name)?;
-        if r.tracked && mine.is_none() {
-            deleted.insert(r.name.clone());
-        }
-        let tips = mine.map(|c| vec![c]).unwrap_or_else(|| r.commits.clone());
-        let mut all = true;
-        for tip in &tips {
-            all &= native::is_ancestor(repo, tip, merge)?;
-        }
-        if all {
-            merged.insert(r.name.clone());
-        }
-    }
-    let pairs: Vec<(String, String)> = remote
-        .iter()
-        .map(|r| (r.name.clone(), ids_hex(&r.commits)))
-        .collect();
-    Ok(dropped_bookmarks(
-        &pairs,
-        |name| deleted.contains(name),
-        |name, _| merged.contains(name),
-    ))
+    native::unmerged_remote_bookmarks(repo, &fork.remote, &prefixes, merge)
 }
 
 fn report_dropped(config: &Config, dropped: &[String]) {
@@ -909,22 +1515,6 @@ fn report_dropped(config: &Config, dropped: &[String]) {
     report(
         "fetch and track them (jj bookmark track <name> --remote <remote>), or delete one deliberately: jj bookmark delete <name>",
     );
-}
-
-/// Remote `(name, commit)` bookmarks that would be lost: not an ancestor of the new fork branch
-/// (`merged(name, commit)`) and not deliberately deleted here (`deleted(name)`).
-fn dropped_bookmarks(
-    remote: &[(String, String)],
-    deleted: impl Fn(&str) -> bool,
-    merged: impl Fn(&str, &str) -> bool,
-) -> Vec<String> {
-    let mut names: Vec<String> = remote
-        .iter()
-        .filter(|(name, commit)| !deleted(name) && !merged(name, commit))
-        .map(|(name, _)| name.clone())
-        .collect();
-    names.sort();
-    names
 }
 
 /// Names whose commit differs between two `name commit` snapshots.
@@ -1010,23 +1600,6 @@ mod tests {
             "a long series is high"
         );
         assert_eq!(conflict_tier(&LOW, &MEDIUM, 13, 1, 1, 1), "high");
-    }
-
-    #[test]
-    fn dropped_bookmarks_need_a_merge_or_a_deliberate_deletion() {
-        let remote: Vec<(String, String)> = [
-            ("patch/merged", "c1"),
-            ("patch/deleted", "c2"),
-            ("patch/untracked", "c3"),
-            ("glue/new", "c4"),
-        ]
-        .iter()
-        .map(|(n, c)| (n.to_string(), c.to_string()))
-        .collect();
-        let dropped = dropped_bookmarks(&remote, |n| n == "patch/deleted", |_, c| c == "c1");
-        assert_eq!(dropped, vec!["glue/new", "patch/untracked"]);
-        assert!(dropped_bookmarks(&remote, |_| true, |_, _| true).is_empty());
-        assert!(dropped_bookmarks(&[], |_| false, |_, _| false).is_empty());
     }
 
     #[test]

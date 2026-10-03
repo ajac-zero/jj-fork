@@ -6,6 +6,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::Result;
 use globset::{Glob, GlobSet, GlobSetBuilder};
+use serde::{Deserialize, Serialize};
 
 use crate::config::{Check, CheckKind, Config, Generated};
 use crate::repo::{Repo, Worktree};
@@ -23,6 +24,40 @@ pub struct Checker<'a> {
     baseline: Option<Worktree>,
     /// Tests that fail on upstream too, as `package test` lines.
     pub upstream_failures: BTreeSet<String>,
+    pub records: Vec<CheckRecord>,
+    comparisons: Vec<GoComparison>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CheckRecord {
+    pub candidate: String,
+    pub target: String,
+    pub subject: String,
+    pub ordinal: usize,
+    pub name: String,
+    pub kind: String,
+    pub outcome: CheckStatus,
+    pub log: PathBuf,
+    pub go_comparisons: Vec<GoComparison>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CheckStatus {
+    Passed,
+    Failed,
+    Skipped,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GoComparison {
+    pub package: String,
+    pub test: String,
+    pub retries: usize,
+    pub upstream_runs: usize,
+    pub verdict: String,
 }
 
 pub enum Outcome {
@@ -53,6 +88,8 @@ impl<'a> Checker<'a> {
             jobs,
             baseline: None,
             upstream_failures: BTreeSet::new(),
+            records: Vec::new(),
+            comparisons: Vec::new(),
         }
     }
 
@@ -71,9 +108,23 @@ impl<'a> Checker<'a> {
         let _ = std::fs::remove_file(&log);
         let initial_head = run::output(dir, "git", &["rev-parse", "--verify", "HEAD"])?;
         let packages = go_packages(dir, &self.target)?;
-        for check in checks {
+        for (ordinal, check) in checks.iter().enumerate() {
+            self.comparisons.clear();
+            let kind = match check.kind {
+                CheckKind::Command => "command",
+                CheckKind::GoTest => "go_test",
+            };
             let packages_arg = packages.join(" ");
             if check.when.as_deref() == Some("go_packages") && packages.is_empty() {
+                self.record(
+                    &initial_head,
+                    log_name,
+                    ordinal,
+                    &check.name,
+                    kind,
+                    CheckStatus::Skipped,
+                    &log,
+                );
                 continue;
             }
             let command = check
@@ -88,6 +139,19 @@ impl<'a> Checker<'a> {
                 CheckKind::Command => run::shell(dir, &command, &self.env, &log)?,
                 CheckKind::GoTest => self.go_test(dir, &command, &log)?,
             };
+            self.record(
+                &initial_head,
+                log_name,
+                ordinal,
+                &check.name,
+                kind,
+                if ok {
+                    CheckStatus::Passed
+                } else {
+                    CheckStatus::Failed
+                },
+                &log,
+            );
             if !ok {
                 let text = std::fs::read_to_string(&log).unwrap_or_default();
                 let tier = match check.low_if_errors_at_most {
@@ -107,13 +171,39 @@ impl<'a> Checker<'a> {
             let relevant = !generated_if_changed || changed.lines().any(|f| inputs.is_match(f));
             if relevant {
                 append(&log, "jj-fork-check: generated\n")?;
-                if !generated_current(dir, generated, &self.env, &log)? {
+                let ok = generated_current(dir, generated, &self.env, &log)?;
+                self.comparisons.clear();
+                self.record(
+                    &initial_head,
+                    log_name,
+                    checks.len(),
+                    "generated",
+                    "generated",
+                    if ok {
+                        CheckStatus::Passed
+                    } else {
+                        CheckStatus::Failed
+                    },
+                    &log,
+                );
+                if !ok {
                     return Ok(Outcome::Fail {
                         check: "generated".into(),
                         tier: "low".into(),
                         log,
                     });
                 }
+            } else {
+                self.comparisons.clear();
+                self.record(
+                    &initial_head,
+                    log_name,
+                    checks.len(),
+                    "generated",
+                    "generated",
+                    CheckStatus::Skipped,
+                    &log,
+                );
             }
         }
         // Checks certify this exact commit, not a tree they leave behind. Do not snapshot
@@ -125,7 +215,22 @@ impl<'a> Checker<'a> {
             "git",
             &["status", "--porcelain", "--untracked-files=no"],
         )?;
-        if head.as_ref().ok() != Some(&initial_head) || !status.is_empty() {
+        self.comparisons.clear();
+        let intact = head.as_ref().ok() == Some(&initial_head) && status.is_empty();
+        self.record(
+            &initial_head,
+            log_name,
+            checks.len() + 1,
+            "candidate integrity",
+            "integrity",
+            if intact {
+                CheckStatus::Passed
+            } else {
+                CheckStatus::Failed
+            },
+            &log,
+        );
+        if !intact {
             append(
                 &log,
                 &format!(
@@ -140,6 +245,30 @@ impl<'a> Checker<'a> {
             });
         }
         Ok(Outcome::Pass)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn record(
+        &mut self,
+        candidate: &str,
+        subject: &str,
+        ordinal: usize,
+        name: &str,
+        kind: &str,
+        outcome: CheckStatus,
+        log: &Path,
+    ) {
+        self.records.push(CheckRecord {
+            candidate: candidate.into(),
+            target: self.target.clone(),
+            subject: subject.into(),
+            ordinal,
+            name: name.into(),
+            kind: kind.into(),
+            outcome,
+            log: log.into(),
+            go_comparisons: self.comparisons.clone(),
+        });
     }
 
     /// Runs a go-test check. A failing test is retried up to RETRIES times (any pass is
@@ -173,13 +302,33 @@ impl<'a> Checker<'a> {
                 let command = format!("go test -count={count} -run '^{test}$' {}", failure.package);
                 run::shell(dir, &command, &env, &scratch_log)
             };
+            let mut retries = 0;
             let verdict = classify_failure(
-                || rerun(dir, 1),
+                || {
+                    retries += 1;
+                    rerun(dir, 1)
+                },
                 || {
                     let baseline = self.baseline()?;
                     rerun(&baseline, UPSTREAM_RUNS)
                 },
             )?;
+            self.comparisons.push(GoComparison {
+                package: failure.package.clone(),
+                test: test.clone(),
+                retries,
+                upstream_runs: if verdict == Verdict::Flaky {
+                    0
+                } else {
+                    UPSTREAM_RUNS
+                },
+                verdict: match verdict {
+                    Verdict::Flaky => "flaky",
+                    Verdict::UpstreamFailure => "upstream_failure",
+                    Verdict::Real => "real_failure",
+                }
+                .into(),
+            });
             match verdict {
                 Verdict::Flaky => append(
                     log,
@@ -501,9 +650,10 @@ mod tests {
             let repo = Repo { root: path.into() };
             let config: Config = toml::from_str("[upstream]\nurl = 'unused'\n").unwrap();
             let target = run::output(path, "git", &["rev-parse", "HEAD"]).unwrap();
-            let mut checker = Checker::new(&repo, &config, target, path.into(), path.into());
+            let mut checker =
+                Checker::new(&repo, &config, target.clone(), path.into(), path.into());
             let checks: Vec<Check> = toml::from_str::<crate::config::Checks>(&format!(
-                "patch = [{{name = 'mutator', run = {command:?}}}]"
+                "patch = [{{name = 'mutator', run = {command:?}}}, {{name = 'skip', run = 'exit 1', when = 'go_packages'}}]"
             ))
             .unwrap()
             .patch;
@@ -517,6 +667,19 @@ mod tests {
                     assert!(text.contains(diagnostic), "{text}");
                 }
             }
+            assert_eq!(checker.records.len(), 3);
+            assert!(checker.records.iter().all(|r| r.candidate == target));
+            assert_eq!(checker.records[0].outcome, CheckStatus::Passed);
+            assert_eq!(checker.records[1].outcome, CheckStatus::Skipped);
+            assert_eq!(checker.records[2].kind, "integrity");
+            assert_eq!(
+                checker.records[2].outcome,
+                if passes {
+                    CheckStatus::Passed
+                } else {
+                    CheckStatus::Failed
+                }
+            );
             if passes {
                 assert!(path.join("artifact").exists());
                 assert!(path.join("ignored").exists());

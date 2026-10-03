@@ -356,14 +356,15 @@ nested_glues() {
   done
 }
 
-cli_version() {
-  fixture cli-version
-  real_jj="$(command -v jj)"; mkdir "$d/bin"
-  printf '#!/usr/bin/env bash\nif [[ "${1:-}" == --version ]]; then echo "jj 0.43.1"; else exec %q "$@"; fi\n' "$real_jj" >"$d/bin/jj"
+initialized_native_commands() {
+  fixture native-commands; advance_upstream
+  mkdir "$d/bin"
+  printf '#!/usr/bin/env bash\necho "jj CLI must not be invoked for initialized maintenance: $*" >&2\nexit 99\n' >"$d/bin/jj"
   chmod +x "$d/bin/jj"
-  expect_code 1 env PATH="$d/bin:$PATH" "$bin" --config "$d/config.toml" check
-  grep -q 'needs jj 0.43.0' "$d/stderr" || fail 'incompatible CLI version not explained'
-  equal "$(refs)" "$before" 'version mismatch changed bookmarks'
+  expect_code 10 env PATH="$d/bin:$PATH" "$bin" --config "$d/config.toml" check
+  equal "$(refs)" "$before" 'native check published bookmarks'
+  expect_code 0 env PATH="$d/bin:$PATH" "$bin" --config "$d/config.toml" sync --push
+  equal "$(git -C "$d/fork.git" show fork/main:new.txt)" 'new upstream' 'native transport did not publish upstream content'
 }
 
 unchanged_candidate_stale() {
@@ -417,7 +418,7 @@ for kind in head export checkout; do run_case "post-publication-$kind-failure" p
 run_case conflicted-glue-repair glue_repair
 run_case unexplained-merge-repair unexplained_repair
 run_case nested-glue-ordering nested_glues
-run_case cli-version-mismatch cli_version
+run_case initialized-native-commands initialized_native_commands
 for kind in operation source; do run_case "unchanged-candidate-stale-$kind" unchanged_candidate_stale "$kind"; done
 echo "$passed passed; $failed failed"
 [[ $failed == 0 ]]

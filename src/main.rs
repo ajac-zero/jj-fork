@@ -2,15 +2,18 @@
 //! resolutions between series, combined into a generated fork branch. It keeps them current as
 //! upstream moves.
 
+mod artifact;
 mod checks;
 mod config;
 mod glue;
 mod init;
 mod native;
 mod reconcile;
+mod repair;
 mod repo;
 mod run;
 mod sync;
+mod workflow;
 
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -55,6 +58,19 @@ enum Command {
         #[arg(long)]
         candidate: Option<String>,
     },
+    /// Authenticate and apply an exact saved proposal after rerunning its required checks.
+    Apply {
+        file: PathBuf,
+        #[arg(long)]
+        push: bool,
+        #[arg(long)]
+        report: Option<PathBuf>,
+    },
+    /// Create isolated repair tasks or validate submissions into a successor saved plan.
+    Repair {
+        #[command(subcommand)]
+        command: repair::Command,
+    },
     /// Add `aliases.fork` to your jj config so `jj fork` runs this tool.
     Alias,
 }
@@ -68,12 +84,18 @@ struct SyncArgs {
     #[arg(long)]
     no_fetch: bool,
     /// Skip the configured checks; detect conflicts only.
-    #[arg(long)]
+    #[arg(long, conflicts_with = "save_plan")]
     no_checks: bool,
     /// Push the fork branch, every series and glue, and a fast-forwarded mirror branch after
     /// success. Refuses if any of them changed on the remote during the run.
-    #[arg(long)]
+    #[arg(long, conflicts_with = "save_plan")]
     push: bool,
+    /// Write one typed, versioned JSON report (text output remains unchanged).
+    #[arg(long)]
+    report: Option<PathBuf>,
+    /// Build and check an executable saved plan without publishing maintenance or pushing.
+    #[arg(long)]
+    save_plan: Option<PathBuf>,
 }
 
 pub fn progress(message: &str) {
@@ -96,6 +118,41 @@ fn main() -> ExitCode {
 }
 
 fn execute(cli: Cli) -> Result<i32> {
+    let report_path = match &cli.command {
+        Command::Check(args) | Command::Sync(args) | Command::Assemble { args, .. } => {
+            args.report.clone()
+        }
+        Command::Apply { report, .. } => report.clone(),
+        _ => None,
+    };
+    let mut reported = false;
+    let result = execute_inner(cli, &mut reported);
+    if let Err(error) = &result
+        && !reported
+        && let Some(path) = report_path
+    {
+        artifact::save_report(
+            &path,
+            &workflow::Report {
+                plan: None,
+                diagnostics: vec![workflow::Issue {
+                    id: "command_error:prepare".into(),
+                    code: "command_error".into(),
+                    subject: "prepare".into(),
+                    candidate: None,
+                    tier: None,
+                    message: format!("{error:#}"),
+                }],
+                exit_code: 1,
+                published_operation: None,
+                push: None,
+            },
+        )?;
+    }
+    result
+}
+
+fn execute_inner(cli: Cli, reported: &mut bool) -> Result<i32> {
     let cwd = std::env::var_os("JJ_WORKSPACE_ROOT")
         .map(PathBuf::from)
         .unwrap_or(std::env::current_dir()?);
@@ -104,6 +161,10 @@ fn execute(cli: Cli) -> Result<i32> {
         return Ok(0);
     }
     let repo = Repo::discover(&cwd)?;
+    if let Command::Apply { file, push, report } = &cli.command {
+        *reported = true; // Apply writes its own authenticated or initial-error report.
+        return workflow::apply(&repo, file, cli.config.as_deref(), *push, report.as_deref());
+    }
     if let Command::Init {
         upstream: Some(url),
     } = &cli.command
@@ -113,12 +174,30 @@ fn execute(cli: Cli) -> Result<i32> {
         init::write_starter_config(&repo.root, url)?;
     }
     let config = Config::load(&repo.root, cli.config.as_deref())?;
-    let options = |args: SyncArgs, candidate: Option<String>| Options {
+    if let Command::Repair { command } = cli.command {
+        return repair::run(&repo, &config, command);
+    }
+    let config_path = std::fs::canonicalize(
+        cli.config
+            .as_deref()
+            .unwrap_or(&repo.root.join(config::FILE_NAME)),
+    )?;
+    let options = |args: SyncArgs, candidate: Option<String>, command: &str| Options {
+        context: workflow::Context {
+            command: command.into(),
+            config_path: config_path.clone(),
+            target_expression: args.target.clone(),
+            candidate_expression: candidate.clone(),
+            fetched: !args.no_fetch,
+            checks_enabled: !args.no_checks,
+        },
         target: args.target,
         candidate,
         fetch: !args.no_fetch,
         checks: !args.no_checks,
         push: args.push,
+        save_plan: args.save_plan,
+        report_path: args.report,
     };
     let (mut session, command) = match cli.command {
         Command::Init { .. } => {
@@ -126,18 +205,42 @@ fn execute(cli: Cli) -> Result<i32> {
             return Ok(0);
         }
         Command::Alias => unreachable!(),
-        Command::Check(args) => (Session::new(&repo, &config, options(args, None))?, "check"),
-        Command::Sync(args) => (Session::new(&repo, &config, options(args, None))?, "sync"),
+        Command::Check(args) => {
+            anyhow::ensure!(
+                args.save_plan.is_none(),
+                "check supports --report, not --save-plan; use sync or assemble"
+            );
+            (
+                Session::new(&repo, &config, options(args, None, "check"))?,
+                "check",
+            )
+        }
+        Command::Sync(args) => (
+            Session::new(&repo, &config, options(args, None, "sync"))?,
+            "sync",
+        ),
         Command::Assemble { args, candidate } => (
-            Session::new(&repo, &config, options(args, candidate))?,
+            Session::new(&repo, &config, options(args, candidate, "assemble"))?,
             "assemble",
         ),
+        Command::Apply { .. } | Command::Repair { .. } => unreachable!(),
     };
-    let code = match command {
-        "check" => session.check()?,
-        "sync" => session.sync()?,
-        _ => session.assemble_command()?,
+    let result = match command {
+        "check" => session.check(),
+        "sync" => session.sync(),
+        _ => session.assemble_command(),
     };
+    let code = match result {
+        Ok(code) => code,
+        Err(error) => {
+            session.record_error(&error);
+            session.write_artifacts(1)?;
+            *reported = true;
+            return Err(error);
+        }
+    };
+    session.write_artifacts(code)?;
+    *reported = true;
     session.finish();
     Ok(code)
 }

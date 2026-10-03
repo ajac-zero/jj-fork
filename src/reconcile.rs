@@ -16,12 +16,21 @@
 //!    deleted, so forget the local bookmark.
 //! 5. The remote lacks it and the commit is not on the remote: new local work, keep it.
 //!
-//! Nothing on the remote is ever changed here.
+//! A remote bookmark that is itself conflicted is not absence: such a bookmark is kept and
+//! reported. Nothing on the remote is ever changed here; the result is recorded in jj's view in
+//! the caller's transaction.
 
-use anyhow::Result;
+use anyhow::{Context, Result};
+use jj_lib::backend::CommitId;
+use jj_lib::git::REMOTE_NAME_FOR_LOCAL_GIT_REPO;
+use jj_lib::object_id::ObjectId as _;
+use jj_lib::op_store::{RefTarget, RemoteRef};
+use jj_lib::ref_name::{RefName, RemoteName};
+use jj_lib::repo::Repo as _;
+use jj_lib::transaction::Transaction;
 
 use crate::config::Config;
-use crate::repo::Repo;
+use crate::native;
 use crate::report;
 use crate::sync::short;
 
@@ -48,29 +57,30 @@ pub enum Decision {
 
 /// Decides what to do with one local bookmark. `is_ancestor(a, b)` says whether `a` is an
 /// ancestor of `b` (or equal), and `on_remote(c)` whether `c` is reachable from any remote ref.
+/// Errors from either (a graph that cannot be read) are errors, never "no".
 pub fn decide(
     local: &Local,
     remote: Option<&str>,
-    is_ancestor: impl Fn(&str, &str) -> bool,
-    on_remote: impl Fn(&str) -> bool,
-) -> Decision {
-    match remote {
+    is_ancestor: impl Fn(&str, &str) -> Result<bool>,
+    on_remote: impl Fn(&str) -> Result<bool>,
+) -> Result<Decision> {
+    Ok(match remote {
         Some(theirs) => {
             if local.conflicted {
-                return Decision::MoveToRemote {
+                return Ok(Decision::MoveToRemote {
                     rule: "2",
                     commit: theirs.to_string(),
-                };
+                });
             }
             let ours = local.commits[0].as_str();
             if ours == theirs {
                 Decision::Unchanged
-            } else if is_ancestor(ours, theirs) {
+            } else if is_ancestor(ours, theirs)? {
                 Decision::MoveToRemote {
                     rule: "1",
                     commit: theirs.to_string(),
                 }
-            } else if !is_ancestor(theirs, ours) && on_remote(ours) {
+            } else if !is_ancestor(theirs, ours)? && on_remote(ours)? {
                 // Diverged, but our commit is already on the remote, so nothing unpushed is lost:
                 // the remote rewrote (restacked or rebased) what we have.
                 Decision::MoveToRemote {
@@ -79,88 +89,113 @@ pub fn decide(
                 }
             } else {
                 Decision::KeepUnpushed {
-                    diverged: !is_ancestor(theirs, ours),
+                    diverged: !is_ancestor(theirs, ours)?,
                 }
             }
         }
-        None if !local.commits.is_empty() && local.commits.iter().all(|c| on_remote(c)) => {
-            Decision::Forget
+        None => {
+            let mut published = !local.commits.is_empty();
+            for commit in &local.commits {
+                published &= on_remote(commit)?;
+            }
+            if published {
+                Decision::Forget
+            } else {
+                Decision::KeepNew
+            }
         }
-        None => Decision::KeepNew,
-    }
+    })
 }
 
-/// Reads local bookmarks and the fork remote's commits for the fork's namespaces.
-fn read(repo: &Repo, config: &Config) -> Result<Vec<(Local, Option<String>)>> {
+/// The fork remote's side of one bookmark.
+enum Remote {
+    Absent,
+    At(String),
+    Conflicted,
+}
+
+/// Local bookmarks in the fork's namespaces (fork branch, mirror, series, glue), each with the
+/// fork remote's side.
+fn read(repo: &dyn jj_lib::repo::Repo, config: &Config) -> Vec<(Local, Remote)> {
     let fork = &config.fork;
-    let mut args: Vec<String> = vec!["bookmark".into(), "list".into(), "--color=never".into()];
-    args.push("--all-remotes".into());
-    args.push(format!("exact:{:?}", fork.branch));
-    args.extend(fork.mirror_branch.iter().map(|m| format!("exact:{m:?}")));
-    args.extend(fork.series_prefixes.iter().map(|p| format!("glob:{p}*")));
-    args.push(format!("glob:{}*", fork.glue_prefix));
-    args.extend([
-        "-T".into(),
-        r#"name ++ "\t" ++ if(remote, remote, "") ++ "\t" ++ present ++ "\t" ++ conflict ++ "\t" ++ added_targets.map(|c| c.commit_id()).join(",") ++ "\n""#.into(),
-    ]);
-    let args: Vec<&str> = args.iter().map(String::as_str).collect();
-    let out = repo.jj(&args)?;
-    let mut locals: Vec<Local> = Vec::new();
-    let mut remotes = std::collections::BTreeMap::new();
-    for line in out.lines() {
-        let f: Vec<&str> = line.split('\t').collect();
-        if f.len() != 5 || f[2] != "true" {
-            continue;
-        }
-        if f[1].is_empty() {
-            locals.push(Local {
-                name: f[0].to_string(),
-                commits: f[4].split(',').map(str::to_string).collect(),
-                conflicted: f[3] == "true",
-            });
-        } else if f[1] == fork.remote && !f[4].contains(',') {
-            remotes.insert(f[0].to_string(), f[4].to_string());
-        }
-    }
-    Ok(locals
-        .into_iter()
-        .map(|l| {
-            let remote = remotes.get(&l.name).cloned();
-            (l, remote)
+    let in_namespace = |name: &str| {
+        name == fork.branch
+            || fork.mirror_branch.as_deref() == Some(name)
+            || name.starts_with(&fork.glue_prefix)
+            || fork
+                .series_prefixes
+                .iter()
+                .any(|p| name.starts_with(p.as_str()))
+    };
+    let view = repo.view();
+    let remote = RemoteName::new(&fork.remote);
+    view.local_bookmarks()
+        .filter(|(name, target)| in_namespace(name.as_str()) && target.is_present())
+        .map(|(name, target)| {
+            let local = Local {
+                name: name.as_str().to_string(),
+                commits: target.added_ids().map(|id| id.hex()).collect(),
+                conflicted: target.has_conflict(),
+            };
+            let theirs = &view
+                .get_remote_bookmark(name.to_remote_symbol(remote))
+                .target;
+            let theirs = if theirs.has_conflict() {
+                Remote::Conflicted
+            } else if let Some(id) = theirs.as_normal() {
+                Remote::At(id.hex())
+            } else {
+                Remote::Absent
+            };
+            (local, theirs)
         })
-        .collect())
+        .collect()
 }
 
-/// Brings every local bookmark in the fork's namespaces in line with the fork remote and
-/// reports each change as a `reconciled:` line.
-pub fn reconcile(repo: &Repo, config: &Config) -> Result<()> {
-    let remote = &config.fork.remote;
-    for (local, theirs) in read(repo, config)? {
-        let decision = decide(
-            &local,
-            theirs.as_deref(),
-            |a, b| repo.is_ancestor(a, b).unwrap_or(false),
-            |c| {
-                repo.revs(&format!(
-                    "{c} & ::remote_bookmarks(remote=exact:{remote:?})"
-                ))
-                .map(|ids| !ids.is_empty())
-                .unwrap_or(false)
-            },
-        );
+/// Brings every local bookmark in the fork's namespaces in line with the fork remote, in `tx`,
+/// and reports each change as a `reconciled:` line.
+pub fn reconcile(tx: &mut Transaction, config: &Config) -> Result<()> {
+    let remote = config.fork.remote.clone();
+    let remote_name = RemoteName::new(&remote);
+    let base = tx.base_repo().clone();
+    let repo = base.as_ref();
+    let remote_heads: Vec<CommitId> = repo
+        .view()
+        .remote_bookmarks(remote_name)
+        .flat_map(|(_, r)| r.target.added_ids())
+        .cloned()
+        .collect();
+    let id = |hex: &str| native::parse_id(hex);
+    let is_ancestor = |a: &str, b: &str| native::is_ancestor(repo, &id(a)?, &id(b)?);
+    let on_remote = |c: &str| -> Result<bool> {
+        let c = id(c)?;
+        for head in &remote_heads {
+            if native::is_ancestor(repo, &c, head)? {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    };
+    for (local, theirs) in read(repo, config) {
         let name = &local.name;
+        let theirs = match theirs {
+            Remote::Conflicted => {
+                report(&format!(
+                    "reconciled: {name} kept ({name}@{remote} is conflicted; settle it with: jj git fetch)"
+                ));
+                continue;
+            }
+            Remote::At(commit) => Some(commit),
+            Remote::Absent => None,
+        };
+        let decision = decide(&local, theirs.as_deref(), is_ancestor, on_remote)
+            .with_context(|| format!("cannot reconcile {name}"))?;
+        let ref_name = RefName::new(name);
         match decision {
             Decision::Unchanged | Decision::KeepNew => {}
             Decision::MoveToRemote { rule, commit } => {
-                repo.jj(&[
-                    "bookmark",
-                    "set",
-                    name,
-                    "-r",
-                    &commit,
-                    "--allow-backwards",
-                    "--quiet",
-                ])?;
+                tx.repo_mut()
+                    .set_local_bookmark_target(ref_name, RefTarget::normal(id(&commit)?));
                 let why = match rule {
                     "1" => "local was behind",
                     "2" => "local was conflicted vs",
@@ -182,7 +217,7 @@ pub fn reconcile(repo: &Repo, config: &Config) -> Result<()> {
                 ));
             }
             Decision::Forget => {
-                repo.jj(&["bookmark", "forget", name, "--quiet"])?;
+                forget(tx, ref_name);
                 report(&format!(
                     "reconciled: {name} forgotten (rule 4: deleted on {remote} after being published)"
                 ));
@@ -192,9 +227,70 @@ pub fn reconcile(repo: &Repo, config: &Config) -> Result<()> {
     Ok(())
 }
 
+/// `jj bookmark forget`: clears the local bookmark and untracks its remote bookmarks (except
+/// Git's own, which cannot be untracked), so a later fetch does not bring it back.
+fn forget(tx: &mut Transaction, name: &RefName) {
+    tx.repo_mut()
+        .set_local_bookmark_target(name, RefTarget::absent());
+    let remotes: Vec<(jj_lib::ref_name::RemoteNameBuf, RemoteRef)> = tx
+        .repo()
+        .view()
+        .remote_views()
+        .filter(|(remote, _)| *remote != REMOTE_NAME_FOR_LOCAL_GIT_REPO)
+        .map(|(remote, _)| {
+            let r = tx
+                .repo()
+                .view()
+                .get_remote_bookmark(name.to_remote_symbol(remote));
+            (remote.to_owned(), r.clone())
+        })
+        .filter(|(_, r)| r.target.is_present() || r.is_tracked())
+        .collect();
+    for (remote, _) in remotes {
+        tx.repo_mut()
+            .untrack_remote_bookmark(name.to_remote_symbol(&remote));
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn decide_ok(
+        local: &Local,
+        remote: Option<&str>,
+        is_ancestor: impl Fn(&str, &str) -> bool,
+        on_remote: impl Fn(&str) -> bool,
+    ) -> Decision {
+        decide(
+            local,
+            remote,
+            |a, b| Ok(is_ancestor(a, b)),
+            |c| Ok(on_remote(c)),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn graph_errors_are_not_absence() {
+        let err = decide(
+            &one("b"),
+            None,
+            |_, _| Ok(false),
+            |_| anyhow::bail!("index unreadable"),
+        );
+        assert!(
+            err.is_err(),
+            "an unreadable graph must not forget a bookmark"
+        );
+        let err = decide(
+            &one("a"),
+            Some("c"),
+            |_, _| anyhow::bail!("no"),
+            |_| Ok(true),
+        );
+        assert!(err.is_err());
+    }
 
     // History: a <- b <- c, and b <- d (a branch off b).
     fn ancestor(a: &str, b: &str) -> bool {
@@ -227,7 +323,7 @@ mod tests {
     #[test]
     fn rule_1_behind_moves_to_remote() {
         assert_eq!(
-            decide(&one("a"), Some("c"), ancestor, published),
+            decide_ok(&one("a"), Some("c"), ancestor, published),
             Decision::MoveToRemote {
                 rule: "1",
                 commit: "c".into()
@@ -238,7 +334,7 @@ mod tests {
     #[test]
     fn equal_is_unchanged() {
         assert_eq!(
-            decide(&one("c"), Some("c"), ancestor, published),
+            decide_ok(&one("c"), Some("c"), ancestor, published),
             Decision::Unchanged
         );
     }
@@ -251,7 +347,7 @@ mod tests {
             conflicted: true,
         };
         assert_eq!(
-            decide(&local, Some("b"), ancestor, published),
+            decide_ok(&local, Some("b"), ancestor, published),
             Decision::MoveToRemote {
                 rule: "2",
                 commit: "b".into()
@@ -262,11 +358,11 @@ mod tests {
     #[test]
     fn rule_3_ahead_and_diverged_are_kept() {
         assert_eq!(
-            decide(&one("c"), Some("b"), ancestor, published),
+            decide_ok(&one("c"), Some("b"), ancestor, published),
             Decision::KeepUnpushed { diverged: false }
         );
         assert_eq!(
-            decide(&one("d"), Some("c"), ancestor, published),
+            decide_ok(&one("d"), Some("c"), ancestor, published),
             Decision::KeepUnpushed { diverged: true }
         );
     }
@@ -276,14 +372,14 @@ mod tests {
         // Local d is on the remote's history (say via the fork branch); the remote's bookmark
         // was rewritten to e.
         assert_eq!(
-            decide(&one("d"), Some("e"), ancestor_rewritten, |c| c == "d"),
+            decide_ok(&one("d"), Some("e"), ancestor_rewritten, |c| c == "d"),
             Decision::MoveToRemote {
                 rule: "3b",
                 commit: "e".into()
             }
         );
         assert_eq!(
-            decide(&one("d"), Some("e"), ancestor_rewritten, |_| false),
+            decide_ok(&one("d"), Some("e"), ancestor_rewritten, |_| false),
             Decision::KeepUnpushed { diverged: true }
         );
     }
@@ -291,7 +387,7 @@ mod tests {
     #[test]
     fn rule_4_published_then_deleted_is_forgotten() {
         assert_eq!(
-            decide(&one("b"), None, ancestor, published),
+            decide_ok(&one("b"), None, ancestor, published),
             Decision::Forget
         );
     }
@@ -299,7 +395,7 @@ mod tests {
     #[test]
     fn rule_5_unpublished_without_remote_is_kept() {
         assert_eq!(
-            decide(&one("d"), None, ancestor, published),
+            decide_ok(&one("d"), None, ancestor, published),
             Decision::KeepNew
         );
         let mixed = Local {
@@ -307,6 +403,9 @@ mod tests {
             commits: vec!["a".into(), "d".into()],
             conflicted: true,
         };
-        assert_eq!(decide(&mixed, None, ancestor, published), Decision::KeepNew);
+        assert_eq!(
+            decide_ok(&mixed, None, ancestor, published),
+            Decision::KeepNew
+        );
     }
 }

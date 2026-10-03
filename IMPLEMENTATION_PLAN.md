@@ -117,8 +117,10 @@ parsing, or operation restore. CLI preparation/transport remains intentional.
 
 ### First-milestone verification
 
-Implemented locally with the high/medium/low assignments above and supervisor
-integration fixes. No commit, push, release, or deployment has been performed.
+Implemented with the high/medium/low assignments above and supervisor integration
+fixes, then committed and pushed as
+[`f4da65b`](https://github.com/ajac-zero/jj-fork/commit/f4da65bd88ccd46ee444fb39ea565ac95acbe83b).
+No new release or deployment was triggered.
 
 - `cargo fmt --check`: clean.
 - `cargo clippy --locked --all-targets -- -D warnings`: clean.
@@ -142,14 +144,114 @@ copies; Watchman support is not enabled. Transport is still CLI-backed and
 multi-ref pushes are not atomic. JSON plans and the following milestones remain
 unimplemented.
 
-## Following milestones
+## Remaining implementation contracts
 
-1. Native preparation: port reconciliation/tracking without changing their
-   policy; replace snapshot/import/fetch/push CLI boundaries where worthwhile.
-2. Versioned structured plans/reports: expose exact candidates, preconditions,
-   diagnostics, and check records. Revalidate every precondition when applying
-   a saved plan; a report is not authorization to apply stale state.
-3. Repair interface: isolated tasks, explicit scope, and validated submissions
-   for people or agents, with coordination around the same maintenance engine.
-4. Product surfaces: a CLI, TUI, CI integration, or dashboard built on the proven
-   engine rather than separate implementations of fork semantics.
+The user authorized implementing and delivering the remaining plan. The CLI is
+the product surface: machine-readable artifacts and isolated tasks support CI
+and agents without adding a dashboard, TUI, service, database, or scheduler.
+The following contracts are the oracle's continuation plan.
+
+### Native preparation and transport
+
+- Load native jj configuration with pinned jj-cli configuration helpers rather
+  than parsing CLI templates. Preserve defaults, conditional scopes, layered
+  overrides, aliases, `JJ_CONFIG`, and identity/operation environment settings.
+  Configuration errors must not silently disable overrides or checks.
+- Snapshot/import, fetch orchestration, reconciliation, tracking, and revision
+  resolution are crate-backed. Freeze after preparation and resolve targets
+  against that exact view. Preserve all reconciliation rules and distinguish
+  conflicted remote targets, absence, tracking, forgetting, and deletion.
+- Unshallow without deleting `.jj`: rebuild the default index and preserve
+  operations, jj-only work, configuration, and workspace metadata.
+- Bootstrap discovery, missing-workspace initialization, explicit init/alias
+  configuration writes, Git unshallow/worktree commands, and configured checks
+  may remain subprocesses. Initialized maintenance must work with a jj wrapper
+  that rejects every CLI invocation.
+- Use jj-lib fetch/push APIs and explicit before/after per-ref targets. Preserve
+  credential helper/SSH/askpass and configured Git-executable behavior. Never
+  mutate process-global environment or copy source credentials into tasks.
+- Keep push eligibility, private-commit, identity, and signing policies. Never
+  rewrite an already-checked candidate as an on-push signing side effect.
+  Unsupported policy must fail explicitly rather than be ignored.
+- Report accepted, rejected, unknown, skipped, and local-bookkeeping-incomplete
+  updates honestly. A transport error does not prove nothing reached the remote.
+
+### Structured reports and executable plans
+
+```text
+check [existing options] --report FILE
+sync [existing options] --save-plan FILE [--report FILE]
+assemble [existing options] --save-plan FILE [--report FILE]
+apply PLAN [--push] [--report FILE]
+```
+
+- Preserve human output and exit codes; reports are informational documents.
+  Saving a plan checks/builds but never publishes maintenance or pushes.
+  Reject saving with `--push` or `--no-checks`. Save failure/conflict plans too.
+- Use strict versioned typed envelopes for plans/reports/tasks. An executable
+  plan includes source repository/workspace identity, frozen operation/working
+  copy/Git/configuration/remote state, exact candidate graph and replay mappings,
+  permitted concrete changes, outcome, stable issue IDs, and check records.
+- Authenticate executable payloads with a repository-local random HMAC key
+  outside tracked files. Domain-separate artifact kinds/versions and verify
+  before interpreting supplied IDs or paths. Reject tampering, unknown fields,
+  malformed IDs, unsupported versions, reports, unsigned inputs, and foreign
+  repository/workspace artifacts. Never offer arbitrary JSON signing/import.
+- Use restrictive race-safe key creation and atomic artifact writes. Store exact
+  candidates through durable unpublished jj operations; do not add source heads
+  or bookmarks to pin them. Plans expire if inputs change or objects are pruned;
+  missing objects never trigger silent candidate reconstruction.
+- `apply` does not run ordinary preparation or accept target/no-checks/no-fetch
+  overrides. It verifies the permitted view/graph delta, probes remotes, reloads
+  trusted configuration, reruns required checks on exact candidates, revalidates
+  all preconditions, and only then guarded-publishes and optionally pushes.
+- Check records are historical evidence, not authorization to skip execution.
+  Never execute commands supplied by an artifact. Failed/not-ready plans require
+  repair rather than arbitrary partial publication.
+
+### Isolated repair tasks and successor plans
+
+```text
+repair start PLAN --issue ISSUE --dir DIR [--allow-path PATH]...
+repair submit TASK_DIR... --save-plan NEXT_PLAN [--report FILE]
+```
+
+- A task is an independent Git object database and jj repository, not a shared
+  Git worktree or jj workspace. Seed exact objects and a `repair/result` bookmark;
+  copy no source remotes, hooks, credentials, or authority key.
+- Authenticate the manifest's parent plan, issue, seed graph, destination,
+  dependencies, and permitted edit scope. Conflict tasks default to conflict
+  paths; check failures require explicit scope when diagnostics cannot supply it.
+- Series tasks preserve captured linear-chain order/count/change identities and
+  target ancestry. Glue/fork tasks require exact captured parents and one
+  authorized resolution commit. New-glue authority names one concrete glue.
+- Validate all path/mode changes, including deletion, rename endpoints, symlinks,
+  executability, and submodules. Reject traversal, metadata/config changes, extra
+  parents, dropped/squashed commits, unauthorized membership, and unrelated work.
+- Submission verifies tasks and current source preconditions, freezes results,
+  imports only candidate objects into unpublished source state, rebuilds
+  downstream glues/fork, and reruns required checks. Repaired series receive
+  patch checks even when already based on the target.
+- Submission saves an authenticated successor plan; it never publishes source
+  bookmarks/checkouts or pushes. `apply` is the sole publication boundary.
+  Independent tasks can batch; overlapping destinations and stale dependencies
+  are refused rather than silently reparented.
+- Independent repositories prevent accidental shared ref/operation mutations,
+  not malicious access to the source filesystem. Untrusted code additionally
+  needs process/filesystem isolation; HMAC is local integrity, not identity.
+
+### Remaining ownership and acceptance
+
+- High native agent owns backend/config/init/reconciliation and dependencies.
+- Medium workflow agent owns engine/CLI, artifacts, reports, and check records.
+- A subsequent high repair assignment owns isolated tasks/submissions once the
+  prepared-plan contracts are integrated. Low agent owns README documentation.
+- Supervisor owns cross-module integration, adversarial regressions, review,
+  combined verification, commits, and pushes. No agent ships independently.
+
+Acceptance includes initialized maintenance without the jj CLI, layered native
+settings, preservation through unshallow, native leases/partial transport results,
+cross-process save/apply, invisible saved candidates, tamper/foreign/expired-plan
+refusal, config/source/operation/remote invalidation, mandatory check reruns,
+isolated valid repairs, rejected unauthorized edits/topology, batch independence,
+repair checks on based-on-target tips, and explicit final application.

@@ -4,8 +4,13 @@
 use std::path::Path;
 
 use anyhow::{Context, Result, bail};
+use jj_lib::object_id::ObjectId as _;
+use jj_lib::ref_name::{RefNameBuf, RemoteName};
+use jj_lib::repo::Repo as _;
+use jj_lib::transaction::Transaction;
 
 use crate::config::{Config, FILE_NAME};
+use crate::native;
 use crate::repo::Repo;
 use crate::{progress, run};
 
@@ -50,6 +55,8 @@ fork = [
     Ok(())
 }
 
+/// Prepares the clone. Bootstrap steps with no jj repository yet (`jj git init --colocate`) and
+/// explicit config writes (`jj config set`) use the jj CLI; everything else is native.
 pub fn init(repo: &Repo, config: &Config) -> Result<()> {
     let root = &repo.root;
     let fork = &config.fork.remote;
@@ -60,14 +67,13 @@ pub fn init(repo: &Repo, config: &Config) -> Result<()> {
         &format!("remote.{fork}.fetch"),
         &format!("+refs/heads/*:refs/remotes/{fork}/*"),
     ])?;
-    // A shallow boundary hides commit parents from jj, so fetch full history and rebuild jj's
-    // view of it.
+    // A shallow boundary hides commit parents from jj. Fetch the full history, then rebuild jj's
+    // commit index from it; the operation log, jj-only commits, and config stay.
     if repo.is_shallow()? {
         progress("unshallowing the clone");
         repo.git(&["fetch", "--quiet", "--unshallow", fork])?;
         if root.join(".jj").exists() {
-            std::fs::remove_dir_all(root.join(".jj"))
-                .context("failed to reset .jj after unshallowing")?;
+            crate::native::reindex(root)?;
         }
     }
     if !root.join(".jj").exists() {
@@ -78,10 +84,11 @@ pub fn init(repo: &Repo, config: &Config) -> Result<()> {
     if repo.git(&["remote", "get-url", upstream]).is_err() {
         repo.git(&["remote", "add", upstream, &config.upstream.url])?;
     }
-    repo.jj(&["git", "fetch", "--remote", fork, "--quiet"])?;
-    repo.jj(&["git", "fetch", "--remote", upstream, "--quiet"])?;
 
-    track(repo, config);
+    let mut native = native::Native::open_for_init(root)?;
+    native.fetch_remote(fork)?;
+    native.fetch_remote(upstream)?;
+    native.track_fork_bookmarks(config)?;
 
     // Revset aliases for people working in the repo by hand, and auto-tracking so a series or
     // glue that someone else pushed becomes a local bookmark on the next fetch.
@@ -126,10 +133,9 @@ pub fn init(repo: &Repo, config: &Config) -> Result<()> {
     ])?;
 
     // Commits need an author for jj to push them; borrow Git's identity when jj has none.
+    let jj_config = native::jj_config::load(root, native::CommandContext::Fork)?;
     for key in ["name", "email"] {
-        let jj_value = repo
-            .jj(&["config", "get", &format!("user.{key}")])
-            .unwrap_or_default();
+        let jj_value: String = jj_config.get(["user", key]).unwrap_or_default();
         let git_value = repo
             .git(&["config", &format!("user.{key}")])
             .unwrap_or_default();
@@ -144,11 +150,13 @@ pub fn init(repo: &Repo, config: &Config) -> Result<()> {
         }
     }
 
-    let series = repo.local_bookmarks(&config.fork.series_prefixes)?;
+    let native = native::Native::load(root)?;
+    let target = native.resolve_single(&config.upstream_ref())?;
+    let series = native::bookmarks_with(native.repo.as_ref(), &config.fork.series_prefixes);
     progress(&format!(
         "ready: upstream {} at {}, {} series",
         config.upstream_ref(),
-        &repo.rev(&config.upstream_ref())?[..12],
+        &target.hex()[..12],
         series.len()
     ));
     Ok(())
@@ -164,17 +172,37 @@ fn tracked_patterns(config: &Config) -> Vec<String> {
     patterns
 }
 
-/// Tracks the fork's bookmarks on its remote, so they exist locally after a fetch.
-pub fn track(repo: &Repo, config: &Config) {
-    let mut args = vec!["bookmark".to_string(), "track".into()];
-    args.extend(
-        tracked_patterns(config)
-            .into_iter()
-            .map(|p| format!("glob:{p}")),
-    );
-    args.extend(["--remote".into(), config.fork.remote.clone()]);
-    let args: Vec<&str> = args.iter().map(String::as_str).collect();
-    let _ = repo.jj(&args);
+/// Whether `name` is one of the fork's bookmarks: the fork branch, mirror, a series, or a glue.
+fn is_fork_bookmark(config: &Config, name: &str) -> bool {
+    let f = &config.fork;
+    name == f.branch
+        || f.mirror_branch.as_deref() == Some(name)
+        || name.starts_with(&f.glue_prefix)
+        || f.series_prefixes
+            .iter()
+            .any(|p| name.starts_with(p.as_str()))
+}
+
+/// Tracks the fork's untracked bookmarks on its remote, in `tx`, so they exist locally (as
+/// `jj bookmark track` does). A tracked remote bookmark whose local bookmark is absent is a
+/// deliberate deletion waiting to be pushed, and stays deleted.
+pub fn track(tx: &mut Transaction, config: &Config) -> Result<()> {
+    let remote = RemoteName::new(&config.fork.remote);
+    let untracked: Vec<RefNameBuf> = tx
+        .repo()
+        .view()
+        .remote_bookmarks(remote)
+        .filter(|(name, r)| {
+            is_fork_bookmark(config, name.as_str()) && !r.is_tracked() && r.target.is_present()
+        })
+        .map(|(name, _)| name.to_owned())
+        .collect();
+    for name in untracked {
+        tx.repo_mut()
+            .track_remote_bookmark(name.to_remote_symbol(remote))
+            .with_context(|| format!("failed to track {}@{}", name.as_str(), remote.as_str()))?;
+    }
+    Ok(())
 }
 
 /// Adds the `jj fork` alias to the user's jj config.
@@ -192,4 +220,74 @@ pub fn install_alias(dir: &Path) -> Result<()> {
     )?;
     progress("added `aliases.fork` to your jj config; `jj fork` now runs jj-fork");
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use jj_lib::ref_name::{RefName, RemoteName};
+
+    use super::*;
+
+    fn git(dir: &Path, args: &[&str]) {
+        run::output(dir, "git", args).unwrap();
+    }
+
+    /// An untracked remote series becomes a local bookmark; a tracked remote series whose local
+    /// bookmark was deleted is a pending deletion and stays deleted; non-fork names are ignored.
+    #[test]
+    fn track_adopts_untracked_series_but_keeps_deliberate_deletions() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("src");
+        std::fs::create_dir(&src).unwrap();
+        git(&src, &["init", "-q", "-b", "main"]);
+        std::fs::write(src.join("a"), "a\n").unwrap();
+        git(&src, &["add", "."]);
+        git(
+            &src,
+            &[
+                "-c",
+                "user.name=t",
+                "-c",
+                "user.email=t@e",
+                "commit",
+                "-qm",
+                "a",
+            ],
+        );
+        for branch in ["patch/theirs", "patch/deleted", "other"] {
+            git(&src, &["branch", branch]);
+        }
+        git(dir.path(), &["clone", "-q", "--bare", "src", "remote.git"]);
+        git(dir.path(), &["clone", "-q", "remote.git", "work"]);
+        let work = dir.path().join("work");
+        let jj = |args: &[&str]| run::output(&work, "jj", args).unwrap();
+        jj(&["git", "init", "--colocate"]);
+        jj(&["bookmark", "track", "patch/deleted", "--remote", "origin"]);
+        jj(&["bookmark", "delete", "patch/deleted"]);
+
+        let config: Config = toml::from_str("[upstream]\nurl = 'u'\n").unwrap();
+        let native = crate::native::Native::load(&work).unwrap();
+        let mut tx = native.start();
+        track(&mut tx, &config).unwrap();
+        let view = tx.repo().view();
+        let origin = RemoteName::new("origin");
+        let local = |name: &str| view.get_local_bookmark(RefName::new(name)).is_present();
+        let tracked = |name: &str| {
+            view.get_remote_bookmark(RefName::new(name).to_remote_symbol(origin))
+                .is_tracked()
+        };
+        assert!(
+            local("patch/theirs") && tracked("patch/theirs"),
+            "untracked series adopted"
+        );
+        assert!(!local("patch/deleted"), "pending deletion resurrected");
+        assert!(
+            tracked("patch/deleted"),
+            "pending deletion must stay tracked"
+        );
+        assert!(
+            !local("other") && !tracked("other"),
+            "non-fork bookmark tracked"
+        );
+    }
 }

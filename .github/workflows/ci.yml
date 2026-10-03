@@ -31,6 +31,9 @@ jobs:
       - run: cargo build --locked
       - run: tests/e2e.sh
       - run: bash tests/transaction.sh
+      - run: bash tests/native.sh
+      - run: bash tests/workflow.sh
+      - run: bash tests/repair.sh
 
   msrv:
     runs-on: ubuntu-latest

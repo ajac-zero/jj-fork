@@ -52,21 +52,6 @@ pub fn succeeds(dir: &Path, program: &str, args: &[&str]) -> Result<bool> {
     Ok(status.success())
 }
 
-/// Runs a program with inherited stdout and stderr, failing when it exits non-zero.
-pub fn run(dir: &Path, program: &str, args: &[&str]) -> Result<()> {
-    let status = Command::new(program)
-        .args(args)
-        .current_dir(dir)
-        .stdin(Stdio::null())
-        .stdout(Stdio::from(std::io::stderr()))
-        .status()
-        .with_context(|| format!("failed to start {program}"))?;
-    if !status.success() {
-        bail!("{program} {} failed", args.join(" "));
-    }
-    Ok(())
-}
-
 /// Runs a shell command, appending its output to `log`. Returns whether it succeeded.
 pub fn shell(dir: &Path, command: &str, env: &[(String, String)], log: &Path) -> Result<bool> {
     let file = File::options()

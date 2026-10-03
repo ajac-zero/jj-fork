@@ -1,18 +1,18 @@
 //! Configuration. Repository facts live in a committed `.jj-fork.toml` so every clone, CI job,
 //! and agent sandbox sees them. Personal overrides live in jj config under `jj-fork.*` with the
-//! same structure, for example `jj config set --user jj-fork.fork.remote mine`.
+//! same structure, for example `jj config set --user jj-fork.fork.remote mine`. They are read
+//! from jj's effective configuration in-process, never by listing it. The whole effective config
+//! serializes, so a saved plan can fingerprint it.
 
 use std::collections::BTreeMap;
 use std::path::Path;
 
-use anyhow::{Context, Result};
-use serde::Deserialize;
-
-use crate::run;
+use anyhow::{Context, Result, bail};
+use serde::{Deserialize, Serialize};
 
 pub const FILE_NAME: &str = ".jj-fork.toml";
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
     pub upstream: Upstream,
@@ -28,7 +28,7 @@ pub struct Config {
     pub low_memory: LowMemory,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Upstream {
     #[serde(default = "default_upstream_remote")]
@@ -38,7 +38,7 @@ pub struct Upstream {
     pub branch: String,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Fork {
     #[serde(default = "default_origin")]
@@ -73,7 +73,7 @@ impl Default for Fork {
     }
 }
 
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Default, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Checks {
     /// Checks for each stale patch, run on its replay onto the upstream target.
@@ -84,7 +84,7 @@ pub struct Checks {
     pub fork: Vec<Check>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Check {
     pub name: String,
@@ -104,7 +104,7 @@ pub struct Check {
     pub low_if_errors_at_most: Option<usize>,
 }
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum CheckKind {
     /// Any failure fails the check.
@@ -115,7 +115,7 @@ pub enum CheckKind {
     GoTest,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Generated {
     /// Globs of generated files. They are regenerated instead of merged and do not count
@@ -131,7 +131,7 @@ pub struct Generated {
     pub header: Option<Header>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Header {
     pub text: String,
@@ -139,7 +139,7 @@ pub struct Header {
     pub comments: BTreeMap<String, String>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Tiers {
     #[serde(default = "default_low_max")]
@@ -158,7 +158,7 @@ impl Default for Tiers {
 }
 
 /// Upper bounds for a conflict tier, measured at the first conflicting commit.
-#[derive(Debug, Clone, Copy, Deserialize)]
+#[derive(Debug, Clone, Copy, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Limits {
     pub files: usize,
@@ -167,7 +167,7 @@ pub struct Limits {
     pub commits: usize,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct LowMemory {
     /// Machines with less memory than this run with reduced parallelism.
@@ -233,7 +233,9 @@ fn default_low_memory_mib() -> u64 {
 }
 
 impl Config {
-    /// Loads the committed config, then applies `jj-fork.*` overrides from jj config.
+    /// Loads the committed config, then applies `jj-fork.*` overrides from the effective jj
+    /// config (user, repo, workspace, and environment layers, as jj resolves them), and checks
+    /// that the bookmark roles are unambiguous.
     pub fn load(root: &Path, path: Option<&Path>) -> Result<Config> {
         let path = path
             .map(Path::to_path_buf)
@@ -246,27 +248,78 @@ impl Config {
         })?;
         let mut table: toml::Table =
             toml::from_str(&text).with_context(|| format!("invalid {}", path.display()))?;
-        let overrides = run::output(root, "jj", &["config", "list", "jj-fork"]).unwrap_or_default();
-        merge(&mut table, parse_overrides(&overrides)?);
+        let jj = crate::native::jj_config::load(root, crate::native::CommandContext::Fork)?;
+        if let Some(overrides) = crate::native::jj_config::fork_overrides(&jj)? {
+            merge(&mut table, overrides);
+        }
         let config: Config = toml::Value::Table(table)
             .try_into()
             .with_context(|| format!("invalid configuration in {} or jj config", path.display()))?;
+        config.validate()?;
         Ok(config)
+    }
+
+    /// Every bookmark must have exactly one role: fork branch, mirror, series, or glue.
+    pub fn validate(&self) -> Result<()> {
+        let fork = &self.fork;
+        if fork.series_prefixes.is_empty() {
+            bail!("fork.series_prefixes must name at least one prefix");
+        }
+        if fork.series_prefixes.iter().any(String::is_empty) || fork.glue_prefix.is_empty() {
+            bail!("series and glue prefixes must not be empty");
+        }
+        let mut seen = std::collections::BTreeSet::new();
+        for prefix in &fork.series_prefixes {
+            if !seen.insert(prefix) {
+                bail!("fork.series_prefixes lists {prefix} twice");
+            }
+            if prefix.starts_with(&fork.glue_prefix)
+                || fork.glue_prefix.starts_with(prefix.as_str())
+            {
+                bail!(
+                    "series prefix {prefix} and glue prefix {} overlap, so a bookmark could be both",
+                    fork.glue_prefix
+                );
+            }
+        }
+        let roles: Vec<&str> = fork
+            .series_prefixes
+            .iter()
+            .chain(std::iter::once(&fork.glue_prefix))
+            .map(String::as_str)
+            .collect();
+        let mut named = vec![("fork.branch", fork.branch.as_str())];
+        named.extend(
+            fork.mirror_branch
+                .as_deref()
+                .map(|m| ("fork.mirror_branch", m)),
+        );
+        for (key, name) in &named {
+            if name.is_empty() {
+                bail!("{key} must not be empty");
+            }
+            if let Some(prefix) = roles.iter().find(|p| name.starts_with(**p)) {
+                bail!("{key} {name} is inside the series or glue prefix {prefix}");
+            }
+        }
+        if fork.mirror_branch.as_deref() == Some(fork.branch.as_str()) {
+            bail!("fork.mirror_branch must differ from fork.branch");
+        }
+        if fork.remote == self.upstream.remote {
+            bail!(
+                "fork.remote and upstream.remote are both {}; they must be different remotes",
+                fork.remote
+            );
+        }
+        if self.upstream.branch.is_empty() {
+            bail!("upstream.branch must not be empty");
+        }
+        Ok(())
     }
 
     pub fn upstream_ref(&self) -> String {
         format!("{}@{}", self.upstream.branch, self.upstream.remote)
     }
-}
-
-/// Turns `jj config list jj-fork` output (`jj-fork.a.b = value` lines) into a table.
-fn parse_overrides(listing: &str) -> Result<toml::Table> {
-    let dotted: String = listing
-        .lines()
-        .filter_map(|line| line.strip_prefix("jj-fork."))
-        .map(|line| format!("{line}\n"))
-        .collect();
-    toml::from_str(&dotted).context("invalid jj-fork overrides in jj config")
 }
 
 fn merge(base: &mut toml::Table, overrides: toml::Table) {
@@ -284,14 +337,18 @@ fn merge(base: &mut toml::Table, overrides: toml::Table) {
 mod tests {
     use super::*;
 
+    fn parse(text: &str) -> Config {
+        toml::from_str(text).unwrap()
+    }
+
     #[test]
     fn overrides_merge_into_nested_tables() {
         let mut base: toml::Table = toml::from_str(
             "[upstream]\nurl = \"a\"\nbranch = \"main\"\n[fork]\nremote = \"origin\"\n",
         )
         .unwrap();
-        let overrides = parse_overrides(
-            "jj-fork.fork.remote = \"mine\"\njj-fork.upstream.branch = \"trunk\"\nother.key = 1\n",
+        let overrides: toml::Table = toml::from_str(
+            "fork.remote = \"mine\"\nupstream.branch = \"trunk\"\nchecks.fork = [{ name = \"t\", run = \"true\" }]\n",
         )
         .unwrap();
         merge(&mut base, overrides);
@@ -300,6 +357,44 @@ mod tests {
         assert_eq!(config.upstream.branch, "trunk");
         assert_eq!(config.upstream.url, "a");
         assert_eq!(config.fork.branch, "fork/main");
+        assert_eq!(config.checks.fork.len(), 1);
+    }
+
+    #[test]
+    fn roles_must_not_overlap() {
+        assert!(parse("[upstream]\nurl = 'u'\n").validate().is_ok());
+        let cases = [
+            ("[fork]\nseries_prefixes = []", "at least one"),
+            ("[fork]\nseries_prefixes = ['']", "not be empty"),
+            ("[fork]\nglue_prefix = ''", "not be empty"),
+            ("[fork]\nseries_prefixes = ['patch/', 'patch/']", "twice"),
+            (
+                "[fork]\nseries_prefixes = ['g']\nglue_prefix = 'glue/'",
+                "overlap",
+            ),
+            ("[fork]\nseries_prefixes = ['glue/x/']", "overlap"),
+            ("[fork]\nbranch = 'patch/fork'", "inside"),
+            ("[fork]\nmirror_branch = 'glue/main'", "inside"),
+            ("[fork]\nmirror_branch = 'fork/main'", "differ"),
+            ("[fork]\nremote = 'upstream'", "different remotes"),
+        ];
+        for (text, message) in cases {
+            let err = parse(&format!("[upstream]\nurl = 'u'\n{text}\n"))
+                .validate()
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains(message), "{text}: {err}");
+        }
+    }
+
+    #[test]
+    fn effective_config_serializes() {
+        let config = parse(
+            "[upstream]\nurl = 'u'\n[checks]\nfork = [{ name = 't', run = 'true', kind = 'go-test' }]\n",
+        );
+        let json = serde_json::to_value(&config).unwrap();
+        assert_eq!(json["fork"]["branch"], "fork/main");
+        assert_eq!(json["checks"]["fork"][0]["kind"], "go-test");
     }
 
     #[test]

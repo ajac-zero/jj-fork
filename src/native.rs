@@ -1,7 +1,9 @@
-//! In-process jj. Loads the colocated workspace with the user's effective jj settings, builds
-//! maintenance commits in a transaction that stays unpublished while checks run, and publishes it
-//! only if the operation log, the working copy, and Git's refs are exactly as they were when the
-//! plan froze.
+//! In-process jj. Loads the colocated workspace with the user's effective jj configuration,
+//! prepares it (snapshot, Git import, fetch, reconciliation, tracking) the way jj commands would,
+//! freezes it, builds maintenance commits in transactions that stay unpublished while checks run,
+//! and publishes one only if the operation log, the working copy, and Git's refs are exactly as
+//! they were when the plan froze. See `prepare` for preparation and `transport` for fetch, probe,
+//! and push.
 //!
 //! Only the default stores are supported: the Git backend colocated with the workspace, the
 //! simple operation-heads store, and the local working copy. Anything else is refused up front
@@ -13,102 +15,68 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use anyhow::{Context, Result, anyhow, bail};
-use futures::StreamExt as _;
+use futures::{StreamExt as _, TryStreamExt as _};
 use globset::GlobSet;
 use jj_lib::backend::CommitId;
 use jj_lib::commit::Commit;
-use jj_lib::config::{ConfigLayer, ConfigSource, StackedConfig};
 use jj_lib::conflicts::{MaterializedTreeValue, materialize_tree_value};
 use jj_lib::files::{MergeResult, merge_hunks};
-use jj_lib::fileset::{self, FilesetAliasesMap, FilesetDiagnostics, FilesetParseContext};
+use jj_lib::fileset::{self, FilesetDiagnostics, FilesetParseContext};
 use jj_lib::git;
 use jj_lib::gitignore::GitIgnoreFile;
+use jj_lib::id_prefix::IdPrefixContext;
 use jj_lib::lock::FileLock;
 use jj_lib::matchers::{Matcher, NothingMatcher};
 use jj_lib::merge::Merge;
 use jj_lib::merged_tree::MergedTree;
 use jj_lib::object_id::ObjectId as _;
 use jj_lib::op_store::{OperationId, RefTarget, RemoteRefState};
-use jj_lib::ref_name::{RefName, RemoteName};
+use jj_lib::ref_name::{RefName, RemoteName, WorkspaceName};
 use jj_lib::repo::{ReadonlyRepo, Repo as JjRepo, StoreFactories};
 use jj_lib::repo_path::{RepoPath, RepoPathUiConverter};
-use jj_lib::revset::RevsetExpression;
+use jj_lib::revset::{self, RevsetDiagnostics, RevsetExpression, SymbolResolver};
 use jj_lib::rewrite::{duplicate_commits, merge_commit_trees};
-use jj_lib::settings::{HumanByteSize, UserSettings};
+use jj_lib::settings::HumanByteSize;
 use jj_lib::simple_op_heads_store::SimpleOpHeadsStore;
 use jj_lib::transaction::Transaction;
 use jj_lib::tree_merge::MergeOptions;
-use jj_lib::working_copy::SnapshotOptions;
+use jj_lib::working_copy::{LockedWorkingCopy, SnapshotOptions};
 use jj_lib::workspace::{Workspace, default_working_copy_factories};
 
-use crate::run;
+pub mod jj_config;
+mod prepare;
+#[cfg(test)]
+mod repo_tests;
+mod transport;
 
-/// The jj release whose CLI and library jj-fork pins. Preparation and push use the CLI, the
-/// maintenance engine uses the library, so both must agree on the repository format.
-pub const JJ_VERSION: &str = "0.43.0";
+use self::jj_config::JjEnv;
+pub use self::jj_config::{CommandContext, EffectiveSettings};
+pub use self::prepare::reindex;
+pub use self::transport::{PushReport, PushUpdate};
 
 /// Runs jj-lib's async APIs to completion. They do local I/O only, so no runtime is needed.
 pub fn block_on<F: Future>(future: F) -> F::Output {
     futures::executor::block_on(future)
 }
 
-/// Refuses to run against a jj CLI other than the pinned release.
-pub fn check_cli(dir: &Path) -> Result<()> {
-    let version = run::output(dir, "jj", &["--version"])?;
-    let number = version.strip_prefix("jj ").unwrap_or(&version);
-    if number.split('-').next() != Some(JJ_VERSION) {
-        bail!("jj-fork needs jj {JJ_VERSION}, found {version}; run scripts/install-jj");
-    }
-    Ok(())
-}
-
-/// Loads the user's effective jj settings (defaults, user, repo, and workspace config) from the
-/// pinned CLI. The listing can contain secrets, so it is never printed, not even in errors.
-fn load_settings(root: &Path) -> Result<UserSettings> {
-    let listing = run::output(
-        root,
-        "jj",
-        &[
-            "--no-pager",
-            "--color=never",
-            "config",
-            "list",
-            "--include-defaults",
-            "-T",
-            r#"name ++ " = " ++ value ++ "\n""#,
-        ],
-    )
-    .map_err(|_| anyhow!("failed to read the effective jj config (jj config list)"))?;
-    let layer = ConfigLayer::parse(ConfigSource::User, &listing)
-        .map_err(|_| anyhow!("failed to parse the effective jj config listing"))?;
-    let mut config = StackedConfig::empty();
-    config.add_layer(layer);
-    UserSettings::from_config(config).context("invalid jj settings")
-}
-
 /// What a snapshot of the working copy must honor, as `jj` itself would: `snapshot.auto-track`
 /// (with fileset aliases), Git's global and repository excludes, and the new-file size limit.
-struct SnapshotPolicy {
+pub(crate) struct SnapshotPolicy {
     auto_track: Box<dyn Matcher>,
     ignores: Arc<GitIgnoreFile>,
     max_new_file_size: u64,
+    ignore_files: Vec<PathBuf>,
 }
 
 impl SnapshotPolicy {
-    fn load(settings: &UserSettings, root: &Path, git_dir: &Path) -> Result<SnapshotPolicy> {
-        let mut aliases = FilesetAliasesMap::new();
-        for name in settings.table_keys("fileset-aliases") {
-            let value = settings.get_string(["fileset-aliases", name])?;
-            aliases
-                .insert(name, value, None)
-                .map_err(|err| anyhow!("invalid fileset alias {name}: {err}"))?;
-        }
+    fn load(env: &JjEnv, root: &Path, git_repo: &GitDirs) -> Result<SnapshotPolicy> {
+        let settings = &env.settings;
         let converter = RepoPathUiConverter::Fs {
             cwd: PathBuf::new(),
             base: PathBuf::new(),
         };
         let context = FilesetParseContext {
-            aliases_map: &aliases,
+            aliases_map: &env.fileset_aliases,
             path_converter: &converter,
         };
         let pattern = settings.get_string("snapshot.auto-track")?;
@@ -121,20 +89,22 @@ impl SnapshotPolicy {
         if max_new_file_size == 0 {
             max_new_file_size = u64::MAX;
         }
+        let mut ignore_files = Vec::new();
+        ignore_files.extend(git_repo.excludes_file.as_ref().map(|path| root.join(path)));
+        ignore_files.push(git_repo.git_dir.join("info").join("exclude"));
         let mut ignores = GitIgnoreFile::empty();
-        if let Some(excludes) = excludes_file(root) {
-            ignores = ignores.chain_with_file(RepoPath::root(), excludes)?;
+        for file in &ignore_files {
+            ignores = ignores.chain_with_file(RepoPath::root(), file.clone())?;
         }
-        ignores =
-            ignores.chain_with_file(RepoPath::root(), git_dir.join("info").join("exclude"))?;
         Ok(SnapshotPolicy {
             auto_track,
             ignores,
             max_new_file_size,
+            ignore_files,
         })
     }
 
-    fn options(&self) -> SnapshotOptions<'_> {
+    pub(crate) fn options(&self) -> SnapshotOptions<'_> {
         SnapshotOptions {
             base_ignores: self.ignores.clone(),
             progress: None,
@@ -145,23 +115,49 @@ impl SnapshotPolicy {
     }
 }
 
-/// Git's global excludes file, as jj finds it: `core.excludesFile`, else `$XDG_CONFIG_HOME/git/ignore`.
-fn excludes_file(root: &Path) -> Option<PathBuf> {
-    if let Ok(path) = run::output(root, "git", &["config", "--path", "core.excludesFile"])
-        && !path.is_empty()
-    {
-        return Some(root.join(path));
+/// Facts about the colocated Git repository, read through jj's own Git handle.
+struct GitDirs {
+    git_dir: PathBuf,
+    /// Git's global excludes file, as jj finds it: `core.excludesFile` (read through the same Git
+    /// configuration jj reads), else `$XDG_CONFIG_HOME/git/ignore`.
+    excludes_file: Option<PathBuf>,
+}
+
+impl GitDirs {
+    fn read(workspace: &Workspace) -> Result<GitDirs> {
+        let backend = git::get_git_backend(workspace.repo_loader().store())
+            .map_err(|_| anyhow!("jj-fork needs a jj repository backed by Git"))?;
+        let colocated = backend
+            .git_workdir()
+            .and_then(|dir| canonical(dir).ok())
+            .is_some_and(|dir| Some(dir) == canonical(workspace.workspace_root()).ok());
+        if !colocated {
+            bail!("jj-fork needs jj colocated with Git (jj git init --colocate)");
+        }
+        let git_repo = backend.git_repo();
+        let config = git_repo.config_snapshot();
+        let configured = config
+            .string("core.excludesFile")
+            .and_then(|value| std::str::from_utf8(&value).ok().map(str::to_string));
+        let excludes_file = match configured {
+            Some(path) => Some(jj_lib::file_util::expand_home_path(&path)),
+            None => std::env::var_os("XDG_CONFIG_HOME")
+                .filter(|x| !x.is_empty())
+                .map(PathBuf::from)
+                .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config")))
+                .map(|dir| dir.join("git").join("ignore")),
+        };
+        Ok(GitDirs {
+            git_dir: backend.git_repo_path().to_path_buf(),
+            excludes_file,
+        })
     }
-    let config_home = std::env::var_os("XDG_CONFIG_HOME")
-        .filter(|x| !x.is_empty())
-        .map(PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config")))?;
-    Some(config_home.join("git").join("ignore"))
 }
 
 /// How a guarded publication ended.
 pub enum Publication {
-    /// Published; the operation that now holds the result.
+    /// Published (or, for a proposal that changes nothing, verified current); the operation that
+    /// now holds the result.
     Done(OperationId),
     /// Nothing was published because the repository changed after the plan froze.
     Stale(String),
@@ -169,22 +165,36 @@ pub enum Publication {
 
 /// The workspace and the repository state frozen after preparation.
 pub struct Native {
-    workspace: Workspace,
+    pub(crate) workspace: Workspace,
+    pub(crate) env: JjEnv,
     /// The repository at the frozen operation (or at the last operation jj-fork published).
     pub repo: Arc<ReadonlyRepo>,
     /// The exact operation heads publication requires: only the frozen operation.
-    heads: Vec<OperationId>,
+    pub(crate) heads: Vec<OperationId>,
     /// The working-copy commit at the frozen operation; its tree is the frozen snapshot.
     pub wc_commit: CommitId,
-    policy: SnapshotPolicy,
+    pub(crate) policy: SnapshotPolicy,
+    effective: EffectiveSettings,
+    repository_path: PathBuf,
 }
 
 impl Native {
-    /// Loads the workspace at `root` and freezes the current operation.
+    /// Loads the workspace at `root` read-only and freezes its current, single operation head.
+    /// Runs no jj CLI and writes nothing; refuses divergent operation heads and a stale working
+    /// copy instead of resolving them.
     pub fn load(root: &Path) -> Result<Native> {
-        let settings = load_settings(root)?;
+        let native = Native::open(root, false)?;
+        native.check_working_copy()?;
+        Ok(native)
+    }
+
+    /// Loads the workspace at `root`. With `resolve`, divergent operation heads are merged (and
+    /// the merge published) the way any jj command would; otherwise they are refused.
+    pub(crate) fn open(root: &Path, resolve: bool) -> Result<Native> {
+        let config = jj_config::load(root, CommandContext::Fork)?;
+        let env = JjEnv::new(config, root)?;
         let workspace = Workspace::load(
-            &settings,
+            &env.settings,
             root,
             &StoreFactories::default(),
             &default_working_copy_factories(),
@@ -208,40 +218,87 @@ impl Native {
                 workspace.working_copy().name()
             );
         }
-        let backend = git::get_git_backend(loader.store())
-            .map_err(|_| anyhow!("jj-fork needs a jj repository backed by Git"))?;
-        let colocated = backend
-            .git_workdir()
-            .and_then(|dir| canonical(dir).ok())
-            .is_some_and(|dir| Some(dir) == canonical(workspace.workspace_root()).ok());
-        if !colocated {
-            bail!("jj-fork needs jj colocated with Git (jj git init --colocate)");
-        }
-        let git_dir = backend.git_repo_path().to_path_buf();
-        let before = block_on(op_heads.get_op_heads())?;
-        let repo = block_on(loader.load_at_head())?;
-        let after = block_on(op_heads.get_op_heads())?;
-        if before != after || after != [repo.op_id().clone()] {
-            bail!("another jj command is running in this repository; rerun when it finishes");
-        }
+        let git_dirs = GitDirs::read(&workspace)?;
+        let repo = if resolve {
+            block_on(loader.load_at_head())?
+        } else {
+            load_single_head(&workspace)?
+        };
+        let heads = vec![repo.op_id().clone()];
         let wc_commit = repo
             .view()
             .get_wc_commit_id(workspace.workspace_name())
             .cloned()
             .context("this workspace has no working-copy commit")?;
-        let wc_tree = repo.store().get_commit(&wc_commit)?.tree();
-        let disk_tree = workspace.working_copy().tree()?;
+        let policy = SnapshotPolicy::load(&env, workspace.workspace_root(), &git_dirs)?;
+        let effective = EffectiveSettings::load(
+            workspace.workspace_root(),
+            &env.settings,
+            &policy.ignore_files,
+        )?;
+        let repository_path = canonical(workspace.repo_path())
+            .with_context(|| format!("cannot resolve {}", workspace.repo_path().display()))?;
+        Ok(Native {
+            workspace,
+            env,
+            repo,
+            heads,
+            wc_commit,
+            policy,
+            effective,
+            repository_path,
+        })
+    }
+
+    /// Re-reads the single current operation head and freezes it, with the working copy that
+    /// must match it.
+    pub(crate) fn freeze(&mut self) -> Result<()> {
+        self.repo = load_single_head(&self.workspace)?;
+        self.heads = vec![self.repo.op_id().clone()];
+        self.wc_commit = self
+            .repo
+            .view()
+            .get_wc_commit_id(self.workspace.workspace_name())
+            .cloned()
+            .context("this workspace has no working-copy commit")?;
+        self.check_working_copy()
+    }
+
+    fn check_working_copy(&self) -> Result<()> {
+        let wc_tree = self.repo.store().get_commit(&self.wc_commit)?.tree();
+        let disk_tree = self.workspace.working_copy().tree()?;
         if disk_tree.tree_ids_and_labels() != wc_tree.tree_ids_and_labels() {
             bail!("the working copy is stale; run jj workspace update-stale");
         }
-        let policy = SnapshotPolicy::load(repo.settings(), workspace.workspace_root(), &git_dir)?;
-        Ok(Native {
-            workspace,
-            repo,
-            heads: after,
-            wc_commit,
-            policy,
-        })
+        Ok(())
+    }
+
+    /// The canonical path of the shared jj repository (`.jj/repo`, or the repository another
+    /// workspace points at).
+    pub fn repository_path(&self) -> &Path {
+        &self.repository_path
+    }
+
+    pub fn workspace_name(&self) -> &WorkspaceName {
+        self.workspace.workspace_name()
+    }
+
+    /// The exact operation heads a publication requires.
+    pub fn op_heads(&self) -> &[OperationId] {
+        &self.heads
+    }
+
+    /// The configuration as jj resolves it now for `context`, read afresh from disk and the
+    /// environment, for fetches and pushes to honor their command-scoped settings.
+    pub(crate) fn context_env(&self, context: CommandContext) -> Result<JjEnv> {
+        let root = self.workspace.workspace_root();
+        JjEnv::new(jj_config::load(root, context)?, root)
+    }
+
+    /// The jj settings that affect planning, snapshots, written commits, fetches, and pushes,
+    /// per command context.
+    pub fn effective_settings(&self) -> &EffectiveSettings {
+        &self.effective
     }
 
     pub fn start(&self) -> Transaction {
@@ -265,78 +322,117 @@ impl Native {
             .map_err(|_| anyhow!("cannot check out the root commit"))
     }
 
-    /// Publishes `tx` if nothing changed since the plan froze, then updates the working copy and
-    /// Git's refs and HEAD to match. Holds, in jj's order, the Git import/export lock, the
-    /// working-copy lock, and (briefly) the operation-heads lock; runs no jj CLI meanwhile.
+    /// Resolves a revision the way jj resolves `-r`, with the user's revset aliases, against
+    /// the frozen repository. It must name exactly one commit.
+    pub fn resolve_single(&self, expression: &str) -> Result<CommitId> {
+        let repo = self.repo.as_ref();
+        let context = self
+            .env
+            .revset_context(repo, self.workspace.workspace_name());
+        let parsed = revset::parse(&mut RevsetDiagnostics::new(), expression, &context)
+            .map_err(|err| anyhow!("invalid revision {expression}: {err}"))?;
+        let id_prefixes = IdPrefixContext::new(self.env.extensions.clone());
+        let resolver = SymbolResolver::new(repo, self.env.extensions.symbol_resolvers())
+            .with_id_prefix_context(&id_prefixes);
+        let resolved = parsed
+            .resolve_user_expression(repo, &resolver)
+            .map_err(|err| anyhow!("revision {expression}: {err}"))?;
+        let ids: Vec<CommitId> = block_on(resolved.evaluate(repo)?.stream().take(2).try_collect())?;
+        match ids.as_slice() {
+            [id] => Ok(id.clone()),
+            [] => bail!("revision {expression} not found"),
+            _ => bail!("revision {expression} names more than one commit"),
+        }
+    }
+
+    /// Loads an operation written earlier with `Transaction::write(..).leave_unpublished()`. It
+    /// must be built directly on the frozen operation. A missing operation, view, or commit means
+    /// the prepared state expired (for example after `jj util gc`), never a reason to rebuild.
+    pub fn load_prepared_operation(&self, op: &OperationId) -> Result<Arc<ReadonlyRepo>> {
+        let expired = |what: &str| {
+            anyhow!(
+                "prepared operation {} has expired ({what} is no longer stored); prepare it again",
+                op.hex()
+            )
+        };
+        let loader = self.workspace.repo_loader();
+        let operation =
+            block_on(loader.load_operation(op)).map_err(|_| expired("the operation"))?;
+        if operation.parent_ids() != std::slice::from_ref(self.repo.op_id()) {
+            bail!(
+                "prepared operation {} was built on another operation than the current {}",
+                op.hex(),
+                self.repo.op_id().hex()
+            );
+        }
+        let repo = block_on(loader.load_at(&operation)).map_err(|_| expired("its view"))?;
+        for head in repo.view().heads() {
+            repo.store()
+                .get_commit(head)
+                .map_err(|_| expired("a commit it references"))?;
+        }
+        Ok(repo)
+    }
+
+    /// Publishes `tx` if nothing changed since the plan froze. See `publish_prepared`.
+    pub fn publish(&mut self, tx: Transaction, description: &str) -> Result<Publication> {
+        let proposal = block_on(tx.write(description))?.leave_unpublished();
+        self.publish_prepared(proposal, description)
+    }
+
+    /// Publishes a proposal (an unpublished operation built on the frozen operation) if nothing
+    /// changed since the plan froze, then updates the working copy and Git's refs and HEAD to
+    /// match. Holds, in jj's order, the Git import/export lock, the working-copy lock, and
+    /// (briefly) the operation-heads lock; runs no jj CLI meanwhile. A proposal whose view equals
+    /// the frozen source changes nothing, but is still checked for staleness under the same
+    /// locks. Which view changes are permitted is the caller's decision.
     ///
     /// A failure after publication returns an error naming the published operation: the local
     /// result stands and nothing is restored.
-    pub fn publish(&mut self, tx: Transaction, description: &str) -> Result<Publication> {
+    pub fn publish_prepared(
+        &mut self,
+        proposal: Arc<ReadonlyRepo>,
+        description: &str,
+    ) -> Result<Publication> {
         let base = self.repo.clone();
+        if proposal.operation().parent_ids() != std::slice::from_ref(base.op_id()) {
+            return Ok(Publication::Stale(
+                "the prepared operation was not built on the frozen operation".into(),
+            ));
+        }
         let store = base.store().clone();
         let name = self.workspace.workspace_name().to_owned();
-        let new_wc = tx.repo().view().get_wc_commit_id(&name).cloned();
-        let moved = moved_bookmarks(base.as_ref(), tx.repo());
+        let new_wc = proposal.view().get_wc_commit_id(&name).cloned();
+        let moved = moved_bookmarks(base.as_ref(), proposal.as_ref());
+        let no_op = proposal.view().store_view() == base.view().store_view();
         let frozen_tree = store.get_commit(&self.wc_commit)?.tree();
-        let _git_lock = FileLock::lock(self.workspace.repo_path().join("git_import_export.lock"))
-            .map_err(|err| anyhow!("failed to lock Git import/export: {err}"))?;
+        let _git_lock = self.git_lock()?;
         let options = self.policy.options();
         let mut locked = block_on(self.workspace.start_working_copy_mutation())?;
-        if locked.locked_wc().old_tree().tree_ids_and_labels() != frozen_tree.tree_ids_and_labels()
-        {
-            return Ok(Publication::Stale(
-                "another command updated the working copy".into(),
-            ));
+        if let Some(reason) = source_changed(
+            locked.locked_wc(),
+            &options,
+            &frozen_tree,
+            &base,
+            &self.heads,
+        )? {
+            return Ok(Publication::Stale(reason));
         }
-        let (snapshot, _) = block_on(locked.locked_wc().snapshot(&options))?;
-        if snapshot.tree_ids_and_labels() != frozen_tree.tree_ids_and_labels() {
-            return Ok(Publication::Stale(
-                "files in the working copy changed (left as they are)".into(),
-            ));
-        }
-        // Checked again under the operation-heads lock below; this early look only names the
-        // cause, since a jj command also changes Git's refs when it exports.
         let op_heads = base.loader().op_heads_store();
-        if block_on(op_heads.get_op_heads())? != self.heads {
-            return Ok(Publication::Stale("another jj operation ran".into()));
-        }
-        let mut probe = base.start_transaction();
-        block_on(git::import_head(probe.repo_mut()))?;
-        let import = git::GitImportOptions {
-            abandon_unreachable_commits: false,
-            record_synthetic_predecessors: false,
-            remote_auto_track_bookmarks: HashMap::new(),
-        };
-        block_on(git::import_refs(probe.repo_mut(), &import))?;
-        if probe.repo().has_changes() {
-            return Ok(Publication::Stale(
-                "Git's refs or HEAD changed outside jj".into(),
-            ));
-        }
-        drop(probe);
 
-        // Rechecking an existing candidate can require no repository edits. It still
-        // needs the same stale-input guard before it may be pushed, without creating
-        // an artificial maintenance operation for a no-op.
-        if !tx.repo().has_changes() {
-            let _lock = block_on(op_heads.lock())?;
-            return Ok(if block_on(op_heads.get_op_heads())? == self.heads {
-                Publication::Done(base.op_id().clone())
-            } else {
-                Publication::Stale("another jj operation ran".into())
-            });
-        }
-
-        let published = block_on(tx.write(description))?.leave_unpublished();
         {
             let _lock = block_on(op_heads.lock())?;
             if block_on(op_heads.get_op_heads())? != self.heads {
                 return Ok(Publication::Stale("another jj operation ran".into()));
             }
-            block_on(op_heads.update_op_heads(&self.heads, published.op_id()))?;
+            // An unchanged view publishes nothing: no artificial maintenance operation.
+            if no_op {
+                return Ok(Publication::Done(base.op_id().clone()));
+            }
+            block_on(op_heads.update_op_heads(&self.heads, proposal.op_id()))?;
         }
-        let op = published.op_id().clone();
-        self.repo = published.clone();
+        let op = proposal.op_id().clone();
+        self.repo = proposal.clone();
         self.heads = vec![op.clone()];
 
         let synced: Result<Arc<ReadonlyRepo>> = (|| {
@@ -355,7 +451,7 @@ impl Native {
                     "checkout skipped {skipped} updates blocked by untracked files; those files were preserved. Move the obstructing files aside and restore the intended checkout before retrying"
                 );
             }
-            let mut tx = published.start_transaction();
+            let mut tx = proposal.start_transaction();
             if let Some(wc) = &new_wc {
                 block_on(git::reset_head(tx.repo_mut(), &store.get_commit(wc)?))
                     .context("failed to reset Git HEAD")?;
@@ -370,7 +466,9 @@ impl Native {
             if !failed.is_empty() {
                 bail!("failed to export bookmarks to Git: {}", failed.join(", "));
             }
-            Ok(block_on(tx.commit("jj-fork: export to Git"))?)
+            Ok(block_on(
+                tx.commit(format!("{description}: export to Git")),
+            )?)
         })();
         match synced {
             Ok(repo) => {
@@ -385,11 +483,95 @@ impl Native {
                 if moved.is_empty() {
                     "no bookmarks moved".to_string()
                 } else {
-                    format!("moved {}", moved.iter().cloned().collect::<Vec<_>>().join(", "))
+                    format!(
+                        "moved {}",
+                        moved.iter().cloned().collect::<Vec<_>>().join(", ")
+                    )
                 }
             ))),
         }
     }
+
+    /// Whether the source is still exactly as frozen: the files on disk (snapshotted with jj's
+    /// policies, so new auto-tracked files count), the working-copy state, the operation heads,
+    /// and Git's refs and HEAD. Returns the reason when it is not. The same check guards
+    /// `publish_prepared`; this one records nothing (the snapshot is not saved) and publishes
+    /// nothing. Takes the Git import/export and working-copy locks briefly.
+    pub fn verify_frozen(&mut self) -> Result<Option<String>> {
+        let base = self.repo.clone();
+        let frozen_tree = base.store().get_commit(&self.wc_commit)?.tree();
+        let _git_lock = self.git_lock()?;
+        let options = self.policy.options();
+        let mut locked = block_on(self.workspace.start_working_copy_mutation())?;
+        source_changed(
+            locked.locked_wc(),
+            &options,
+            &frozen_tree,
+            &base,
+            &self.heads,
+        )
+    }
+
+    /// The lock jj holds while importing from and exporting to the colocated Git repository.
+    pub(crate) fn git_lock(&self) -> Result<FileLock> {
+        FileLock::lock(self.workspace.repo_path().join("git_import_export.lock"))
+            .map_err(|err| anyhow!("failed to lock Git import/export: {err}"))
+    }
+}
+
+/// Why the source no longer matches the frozen state, if it does not. The caller holds the Git
+/// import/export lock and the working-copy lock; the operation heads are compared without a lock
+/// (a publication compares them again under the operation-heads lock).
+fn source_changed(
+    locked_wc: &mut dyn LockedWorkingCopy,
+    options: &SnapshotOptions<'_>,
+    frozen_tree: &MergedTree,
+    base: &Arc<ReadonlyRepo>,
+    heads: &[OperationId],
+) -> Result<Option<String>> {
+    if locked_wc.old_tree().tree_ids_and_labels() != frozen_tree.tree_ids_and_labels() {
+        return Ok(Some("another command updated the working copy".into()));
+    }
+    let (snapshot, _) = block_on(locked_wc.snapshot(options))?;
+    if snapshot.tree_ids_and_labels() != frozen_tree.tree_ids_and_labels() {
+        return Ok(Some(
+            "files in the working copy changed (left as they are)".into(),
+        ));
+    }
+    // A jj command also changes Git's refs when it exports, so name that cause first.
+    if block_on(base.loader().op_heads_store().get_op_heads())? != heads {
+        return Ok(Some("another jj operation ran".into()));
+    }
+    let mut probe = base.start_transaction();
+    block_on(git::import_head(probe.repo_mut()))?;
+    let import = git::GitImportOptions {
+        abandon_unreachable_commits: false,
+        record_synthetic_predecessors: false,
+        remote_auto_track_bookmarks: HashMap::new(),
+    };
+    block_on(git::import_refs(probe.repo_mut(), &import))?;
+    if probe.repo().has_changes() {
+        return Ok(Some("Git's refs or HEAD changed outside jj".into()));
+    }
+    Ok(None)
+}
+
+/// Loads the repository at its only operation head, writing nothing.
+fn load_single_head(workspace: &Workspace) -> Result<Arc<ReadonlyRepo>> {
+    let loader = workspace.repo_loader();
+    let op_heads = loader.op_heads_store();
+    let heads = block_on(op_heads.get_op_heads())?;
+    let [head] = heads.as_slice() else {
+        bail!(
+            "another jj command is running in this repository (divergent operations); rerun when it finishes"
+        );
+    };
+    let operation = block_on(loader.load_operation(head))?;
+    let repo = block_on(loader.load_at(&operation))?;
+    if block_on(op_heads.get_op_heads())? != heads {
+        bail!("another jj command is running in this repository; rerun when it finishes");
+    }
+    Ok(repo)
 }
 
 fn canonical(path: &Path) -> std::io::Result<PathBuf> {
@@ -466,6 +648,40 @@ pub struct RemoteBookmark {
     pub name: String,
     pub commits: Vec<CommitId>,
     pub tracked: bool,
+}
+
+/// The no-silent-drop guard: bookmarks on `remote` under `prefixes` that publishing `merge` would
+/// silently drop. A remote bookmark is kept when it is merged into `merge` (its local bookmark,
+/// which is what gets pushed, or the remote's commits when there is no local copy) or when it
+/// is deliberately deleted here: tracked on the remote and absent locally, a pending deletion.
+/// An untracked remote bookmark without a local copy is not a deletion; it is unmerged work.
+/// Sorted by name.
+pub fn unmerged_remote_bookmarks(
+    repo: &dyn JjRepo,
+    remote: &str,
+    prefixes: &[String],
+    merge: &CommitId,
+) -> Result<Vec<String>> {
+    let mut dropped = Vec::new();
+    for r in remote_bookmarks(repo, remote) {
+        if !prefixes.iter().any(|p| r.name.starts_with(p.as_str())) {
+            continue;
+        }
+        let local = bookmark(repo, &r.name)?;
+        if r.tracked && local.is_none() {
+            continue;
+        }
+        let tips = local.map(|c| vec![c]).unwrap_or(r.commits);
+        let mut merged = true;
+        for tip in &tips {
+            merged &= is_ancestor(repo, tip, merge)?;
+        }
+        if !merged {
+            dropped.push(r.name);
+        }
+    }
+    dropped.sort();
+    Ok(dropped)
 }
 
 pub fn is_ancestor(repo: &dyn JjRepo, ancestor: &CommitId, descendant: &CommitId) -> Result<bool> {
