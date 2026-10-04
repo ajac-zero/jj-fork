@@ -194,10 +194,16 @@ fn execute_inner(cli: Cli, reported: &mut bool) -> Result<i32> {
         init::install_alias(&cwd)?;
         return Ok(0);
     }
-    let repo = Repo::discover(&cwd)?;
     if let Command::Skill { name, install } = &cli.command {
-        return skill::run(&repo.root, name.as_deref(), *install);
+        // Listing and printing need no repository; only --install does.
+        let root = if *install {
+            Repo::discover(&cwd)?.root
+        } else {
+            cwd.clone()
+        };
+        return skill::run(&root, name.as_deref(), *install);
     }
+    let repo = Repo::discover(&cwd)?;
     if let Command::Apply { file, push, report } = &cli.command {
         *reported = true; // Apply writes its own authenticated or initial-error report.
         return workflow::apply(&repo, file, cli.config.as_deref(), *push, report.as_deref());

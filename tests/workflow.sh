@@ -262,6 +262,7 @@ stored_config_and_skills() {
   # A checkout without the committed file (such as a series) uses the stored copy.
   rm .jj-fork.toml
   expect 0 "$bin" check --no-checks --no-fetch
+  (cd / && "$bin" skill >/dev/null) || fail 'skill listing needs a repository'
   expect 0 "$bin" skill
   grep -q setting-up-forks-on-amp "$d/out" || fail 'bundled skills not listed'
   expect 0 "$bin" skill setting-up-forks-on-amp
