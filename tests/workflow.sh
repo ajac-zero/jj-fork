@@ -254,6 +254,18 @@ apply_config_override() {
   expect 0 "$bin" --config "$d/same-config.toml" apply "$d/plan.json"
 }
 
+init_follows_upstream_url() {
+  fixture upstream-url
+  # init follows the committed upstream URL when the remote points elsewhere (a renamed upstream).
+  git remote set-url upstream "$d/old-upstream.git"
+  expect 0 invoke init
+  equal "$(git remote get-url upstream)" "$(sed -n 's/^url = "\(.*\)"$/\1/p' "$d/config.toml" | head -1)" 'init did not update a stale upstream URL'
+  grep -q 'updated remote upstream' "$d/err" || fail 'URL update not reported'
+  expect 0 invoke init
+  grep -q 'updated remote' "$d/err" && fail 'matching URL was rewritten'
+  return 0
+}
+
 stored_config_and_skills() {
   fixture stored-config
   cp "$d/config.toml" .jj-fork.toml
@@ -360,6 +372,7 @@ run_case intermediate-conflict-handles intermediate_handles
 run_case saved-no-op-guard no_op_guard
 run_case atomic-output-and-flags bad_output
 run_case apply-config-override apply_config_override
+run_case init-follows-upstream-url init_follows_upstream_url
 run_case stored-config-and-skills stored_config_and_skills
 run_case wrong-repository wrong_repository
 run_case wrong-workspace wrong_workspace

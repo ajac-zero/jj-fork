@@ -82,8 +82,20 @@ pub fn init(repo: &Repo, config: &Config) -> Result<()> {
     }
     crate::config::store_copy(root);
     let upstream = &config.upstream.remote;
-    if repo.git(&["remote", "get-url", upstream]).is_err() {
-        repo.git(&["remote", "add", upstream, &config.upstream.url])?;
+    match repo.git(&["remote", "get-url", upstream]) {
+        Err(_) => {
+            repo.git(&["remote", "add", upstream, &config.upstream.url])?;
+        }
+        // The committed URL is authoritative: an upstream that moved or was renamed must not
+        // leave existing clones fetching from the old address.
+        Ok(current) if current != config.upstream.url => {
+            repo.git(&["remote", "set-url", upstream, &config.upstream.url])?;
+            progress(&format!(
+                "updated remote {upstream} from {current} to {}",
+                config.upstream.url
+            ));
+        }
+        Ok(_) => {}
     }
 
     let mut native = native::Native::open_for_init(root)?;

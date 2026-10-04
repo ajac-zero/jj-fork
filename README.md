@@ -38,6 +38,8 @@ jj fork alias                   add `aliases.fork` to your jj config
 
 Series isolation is structural, not semantic: series are rooted on upstream, none contains another, and conflicts live in glues. jj-fork does not judge whether a patch builds and passes alone, and it reads no forge or CI status. That belongs to the repository's own CI or owner. Configured `[checks]` run only on stale series and the fork candidate.
 
+`init` also keeps the `upstream` remote on the committed `[upstream] url`: if the remote points elsewhere (the upstream moved or was renamed), init updates it and says so.
+
 ## Agent skills
 
 The skills for operating a fork and for setting one up on Amp are embedded in the binary. `jj fork skill` lists them, `jj fork skill NAME` prints one, and `jj fork skill --install` writes them to `.agents/skills/`, where a repository can commit them (for example in its `tooling/*` series). `check`, `sync`, and `assemble` warn when a committed copy differs from the installed version. The committed config is also kept at `.jj/repo/jj-fork.toml`, so checkouts that lack it, such as a series, still find it.
