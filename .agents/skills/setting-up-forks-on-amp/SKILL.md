@@ -22,23 +22,23 @@ Amp-specific onboarding for a fork maintained with jj-fork. Day-to-day operation
    jj-fork init                # remotes, full history, jj, tracking, revset aliases
    jj-fork alias               # optional: `jj fork` instead of `jj-fork`
    ```
-   `jj` must match the version jj-fork was built against (see its README).
+   `jj` must match the version jj-fork was built against (see its README), and `git` must be >= 2.41 (put a newer git first on PATH if needed). Checks run with the caller's PATH, so put the repo's toolchain (for example `go`) on it.
 2. Create `.jj-fork.toml` (`jj-fork init --upstream URL` writes a starter). Set `series_prefixes`, and `[checks]` only if the repo should run local checks.
 3. Commit `.jj-fork.toml`, `.agents/`, and `AGENTS.md` to the `tooling/*` series, then `jj fork assemble --push`.
-4. Install the bundled skills into the same series: `jj fork skill --install`, commit, and rerun after upgrading jj-fork (`check` warns when they differ).
+4. Install the bundled skills into the same series: `jj fork skill --install` (writes `.agents/skills/<name>/SKILL.md`), commit, and rerun after upgrading jj-fork (`check` warns when they differ).
 5. Write the repo's `AGENTS.md`: that `fork/main` is generated and never committed onto; to load the `maintaining-forks-with-jj-fork` skill before version-control work; that a new feature is its own `patch/<name>` rooted on upstream and must build and test on upstream alone; and that fork-only files belong in the `tooling/*` series.
 
 ## Amp project settings
 
 Changing these affects every user of the project; get explicit approval first.
 
-- Base branch (what orbs clone and Ship targets): `amp projects update <project> --base-branch fork/main`. Use `fork/main` because it holds the fork's code and its config. `main` is only the upstream mirror and a series lacks the other patches.
+- Base branch (what orbs clone and Ship targets): verify it is `fork/main` (`amp projects get <project>`), else `amp projects update <project> --base-branch fork/main`. Use `fork/main` because it holds the fork's code and its config. `main` is only the upstream mirror and a series lacks the other patches. The branch must already contain `.jj-fork.toml` and the skills, so change it only after step 3 has landed on `fork/main`.
 - Ship behavior: `amp projects update <project> --ship-behavior custom --custom-ship-prompt-file .agents/ship.md`. Keep `.agents/ship.md` in the repo and push the same text to the project. The prompt should: pick `patch/*` or `tooling/*`; start with `jj fork create` or continue an existing series with `jj new <series>`; verify that series alone with the repo's own build and tests; then `jj fork assemble --save-plan` and `jj fork apply --push`; and stop and ask if the series is unclear.
 - Orb size: raise it if checks need memory (`--orb-size`).
 
 ## Scheduled fork owner
 
-Create one thread schedule (building-schedules skill) that runs `jj fork sync --save-plan P --report R`. Exit 0: `jj fork apply P --push`. Exit 20: one fixer per issue in `R` runs `jj fork repair start` and `submit`, then `apply`. Fixer orbs are separate machines, so they must return their results to the owner (a branch or an artifact) or run inside the owner's orb. Do not give fixers push access to `fork/main`.
+Create one thread schedule (building-schedules skill) that runs `jj fork sync --save-plan P --report R`. Exit 0: `jj fork apply P --push`. Exit 20: one fixer per issue in `R` runs `jj fork repair start` and `submit`, then `apply`. Fixer orbs are separate machines, so they must return their results to the owner (a branch or an artifact) or run inside the owner's orb. Do not give fixers push access to `fork/main`. Apply a saved plan right after saving it and in the same checkout: other jj operations make it stale. An end-to-end fixer-orb handoff is not provided by jj-fork; test yours before relying on it.
 
 ## Verify
 

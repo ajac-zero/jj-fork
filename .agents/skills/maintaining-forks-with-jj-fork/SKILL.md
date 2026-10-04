@@ -46,6 +46,7 @@ jj fork apply /tmp/plan.json --push                                  # reruns ch
 - Write plans/reports **outside the working tree** (or in a Git-ignored path). An unignored file inside it is a new source edit and `apply` refuses it as stale.
 - `apply` takes no `--target/--no-fetch/--no-checks`; edited, foreign, expired, or stale plans are refused. If it refuses as stale, save a new plan.
 - Do not run `jj util gc` between save and apply; the candidate objects can expire.
+- A plan is bound to the repository's operation state: any other jj operation after saving (even `jj new`) makes it stale, and so does applying from a different checkout. Apply right after saving, in the same checkout. Read-only commands (`jj log`, `jj status` with `--ignore-working-copy`) are fine.
 - `--save-plan` cannot be combined with `--push` or `--no-checks`.
 
 ## Repairing a conflicted or broken series (one isolated task per issue)
@@ -111,7 +112,8 @@ The no-silent-drop guard refuses to move `fork/main` while a series/glue bookmar
 - Do not `jj rebase -s` a series: it drags descendants. jj-fork copies series onto the new target and leaves originals.
 - Small-RAM machines: configure `[low_memory]` in `.jj-fork.toml`; checks use `{jobs}`/`{memory_limit_mib}`.
 - Ignored upstream failures print `note: also fails on upstream, ignored`; do not "fix" them in a patch.
-- Native commands do not need the jj CLI after `init`; git and jj must be on PATH for init/aliases, worktrees, and checks.
+- Native commands do not need the jj CLI after `init`; git and jj must be on PATH for init/aliases, worktrees, and checks. `init` needs git >= 2.41 (jj's requirement); put a newer git first on PATH if the system one is older. Checks run with the caller's PATH, so toolchains such as `go` must be on it.
+- The stored config copy (`.jj/repo/jj-fork.toml`) is refreshed only by a command run in a checkout that contains `.jj-fork.toml`. After the committed config changes, run `jj fork check --no-checks` once from such a checkout (for example `fork/main`) so series checkouts see it.
 - Conflict-only `check`/`sync`/`assemble` run: `--no-checks` (not `--no-tests`) skips configured checks; it cannot be combined with `--save-plan`/`apply`, and retirement has no such override.
 - A full `check`/`sync` on a large Go repo takes tens of minutes (ai-gateway: ~30 min, ~3 GB, dominated by tests); a conflict-only `--no-checks` run takes about a second. Run the scheduled owner with a generous timeout.
 - `jj fork init` writes only the revset aliases (`trunk()`, `fork_patches()`, `fork_glue()`, `fork_parents()`, `fork_head()`), not command aliases like `patch-new` or `fork-log`.
