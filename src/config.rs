@@ -5,12 +5,44 @@
 //! serializes, so a saved plan can fingerprint it.
 
 use std::collections::BTreeMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 
 pub const FILE_NAME: &str = ".jj-fork.toml";
+/// Copy kept inside the jj repository, so checkouts of bookmarks without the committed file (a
+/// series is rooted on upstream) still find the configuration.
+const STORED: &str = ".jj/repo/jj-fork.toml";
+
+/// Chooses the configuration file: an explicit path, else the stored copy of the committed file
+/// (refreshed from it), else the committed file. Using the stored copy everywhere makes saved
+/// plans independent of which checkout created or applies them; its content is fingerprinted.
+pub fn resolve_path(root: &Path, explicit: Option<&Path>) -> PathBuf {
+    if let Some(path) = explicit {
+        return path.to_path_buf();
+    }
+    let tracked = root.join(FILE_NAME);
+    let stored = root.join(STORED);
+    if tracked.exists() {
+        store_copy(root);
+    }
+    if stored.exists() { stored } else { tracked }
+}
+
+/// Best effort: a read-only repository directory only loses the fallback.
+pub fn store_copy(root: &Path) {
+    let tracked = root.join(FILE_NAME);
+    let stored = root.join(STORED);
+    if !root.join(".jj/repo").is_dir() {
+        return;
+    }
+    if let Ok(text) = std::fs::read(&tracked)
+        && std::fs::read(&stored).ok().as_deref() != Some(text.as_slice())
+    {
+        let _ = std::fs::write(&stored, text);
+    }
+}
 
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -237,9 +269,7 @@ impl Config {
     /// config (user, repo, workspace, and environment layers, as jj resolves them), and checks
     /// that the bookmark roles are unambiguous.
     pub fn load(root: &Path, path: Option<&Path>) -> Result<Config> {
-        let path = path
-            .map(Path::to_path_buf)
-            .unwrap_or_else(|| root.join(FILE_NAME));
+        let path = resolve_path(root, path);
         let text = std::fs::read_to_string(&path).with_context(|| {
             format!(
                 "failed to read {}; run `jj fork init` first",

@@ -245,10 +245,33 @@ bad_output() {
 
 apply_config_override() {
   fixture apply-config; save
-  cp "$d/config.toml" "$d/other-config.toml"
+  cp "$d/config.toml" "$d/same-config.toml"
+  printf '\n# different\n' | cat "$d/config.toml" - >"$d/other-config.toml"
   expect 1 "$bin" --config "$d/other-config.toml" apply "$d/plan.json"
   grep -q 'apply cannot use --config' "$d/err" || fail 'apply config refusal was not explained'
   grep -q 'Omit --config' "$d/err" || fail 'apply config refusal gave no remedy'
+  # A different path with identical content is the saved configuration.
+  expect 0 "$bin" --config "$d/same-config.toml" apply "$d/plan.json"
+}
+
+stored_config_and_skills() {
+  fixture stored-config
+  cp "$d/config.toml" .jj-fork.toml
+  expect 0 "$bin" check --no-checks --no-fetch
+  cmp .jj-fork.toml .jj/repo/jj-fork.toml
+  # A checkout without the committed file (such as a series) uses the stored copy.
+  rm .jj-fork.toml
+  expect 0 "$bin" check --no-checks --no-fetch
+  expect 0 "$bin" skill
+  grep -q setting-up-forks-on-amp "$d/out" || fail 'bundled skills not listed'
+  expect 0 "$bin" skill setting-up-forks-on-amp
+  grep -q '^name: setting-up-forks-on-amp' "$d/out" || fail 'skill not printed'
+  expect 1 "$bin" skill nonexistent
+  expect 0 "$bin" skill maintaining-forks-with-jj-fork --install
+  cmp .agents/skills/maintaining-forks-with-jj-fork/SKILL.md <("$bin" skill maintaining-forks-with-jj-fork)
+  printf 'old\n' >.agents/skills/maintaining-forks-with-jj-fork/SKILL.md
+  expect 0 "$bin" check --no-checks --no-fetch
+  grep -q 'differs from this jj-fork version' "$d/err" || fail 'stale skill not reported'
 }
 
 wrong_repository() {
@@ -327,6 +350,7 @@ run_case intermediate-conflict-handles intermediate_handles
 run_case saved-no-op-guard no_op_guard
 run_case atomic-output-and-flags bad_output
 run_case apply-config-override apply_config_override
+run_case stored-config-and-skills stored_config_and_skills
 run_case wrong-repository wrong_repository
 run_case wrong-workspace wrong_workspace
 run_case inside-source-artifacts artifact_paths

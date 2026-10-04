@@ -5,7 +5,7 @@ description: Maintains a long-lived fork as jj series (patch/*, tooling/*) plus 
 
 # Maintaining a fork with jj-fork
 
-`jj-fork` (also `jj fork` after `jj-fork alias`) keeps a fork current with upstream. Use it instead of hand-rolled rebases. Needs jj 0.43.0 and a colocated clone with a committed `.jj-fork.toml`.
+`jj-fork` (also `jj fork` after `jj-fork alias`) keeps a fork current with upstream. Use it instead of hand-rolled rebases. Needs jj 0.43.0 and a colocated clone with a committed `.jj-fork.toml` (also stored at `.jj/repo/jj-fork.toml`, so checkouts of a series, which lack the file, still find it).
 
 ## Model
 
@@ -13,6 +13,12 @@ description: Maintains a long-lived fork as jj series (patch/*, tooling/*) plus 
 - **Glue**: `glue/<a>+<b>` descends from exactly those series' tips and holds only the resolution of their conflicts. Three-way: `glue/a+b+c` (parents: `glue/a+b` and `patch/c`).
 - **`fork/main`**: a generated merge of upstream, every series, every glue. Never edit it; rebuilding is always safe.
 - Conflicts between two series that each pass alone belong in a glue, never in a series or in `fork/main`.
+
+## What jj-fork does not verify
+
+Series isolation is structural: every series is rooted on upstream, none contains another, and conflicts live in glues. Whether a series builds and passes its tests **alone** is not judged by jj-fork and it reads no forge or CI status. Before shipping a series, run the repo's own build/tests on that series alone (a checkout at its tip, not on `fork/main`, which contains every other patch). Configured `[checks]` run only on stale series and on the fork candidate.
+
+Setting up a repository on Amp (orb setup, base branch, Ship prompt, scheduled owner) is the `setting-up-forks-on-amp` skill. Print bundled skills with `jj fork skill [NAME]`; commit them with `jj fork skill --install`. `check`/`sync`/`assemble` warn when a committed copy differs from the installed version.
 
 ## Routine (single owner)
 

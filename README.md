@@ -26,12 +26,21 @@ jj fork assemble [--save-plan FILE] plan glue restacks and fork assembly
 jj fork apply PLAN [--push]     revalidate and publish a saved plan
 jj fork repair start PLAN --issue ISSUE --dir DIR [--allow-path PATH]...
 jj fork repair submit TASK_DIR... --save-plan NEXT_PLAN
+jj fork skill [NAME] [--install] print or install the agent skills bundled with this version
 jj fork alias                   add `aliases.fork` to your jj config
 ```
 
 `check` constructs each stale series as an unpublished jj candidate, then materializes that exact commit in a detached Git worktree and runs the configured patch checks there. Each problem gets a difficulty tier (`[tier=low|medium|high]`) from the size of the conflict, or from the check that failed, so an automated fixer can pick a matching model.
 
 `sync` and `assemble` use the same candidate-first transaction model: plan the jj operations and checks against unpublished candidates in detached worktrees; publish local bookmarks only after the required checks pass and the source state is still current. Checks do not change the source checkout. A stale local operation or source edit discovered while checks run makes the command refuse publication and preserve that work. A failed check discards planned maintenance rather than partially rebasing a series or moving the fork branch. Preparation (including snapshot, fetch, and reconciliation) remains separate and may already have changed local state; discarded transactions may also leave unreachable objects. This is not byte-for-byte rollback or filesystem/remote atomicity.
+
+## What jj-fork does not verify
+
+Series isolation is structural, not semantic: series are rooted on upstream, none contains another, and conflicts live in glues. jj-fork does not judge whether a patch builds and passes alone, and it reads no forge or CI status. That belongs to the repository's own CI or owner. Configured `[checks]` run only on stale series and the fork candidate.
+
+## Agent skills
+
+The skills for operating a fork and for setting one up on Amp are embedded in the binary. `jj fork skill` lists them, `jj fork skill NAME` prints one, and `jj fork skill --install` writes them to `.agents/skills/`, where a repository can commit them (for example in its `tooling/*` series). `check`, `sync`, and `assemble` warn when a committed copy differs from the installed version. The committed config is also kept at `.jj/repo/jj-fork.toml`, so checkouts that lack it, such as a series, still find it.
 
 ## Series lifecycle
 

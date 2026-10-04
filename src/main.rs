@@ -12,6 +12,7 @@ mod reconcile;
 mod repair;
 mod repo;
 mod run;
+mod skill;
 mod sync;
 mod workflow;
 
@@ -95,6 +96,14 @@ enum Command {
     Repair {
         #[command(subcommand)]
         command: repair::Command,
+    },
+    /// Print or install the agent skills bundled with this version of jj-fork.
+    Skill {
+        /// Skill name; omit to list them (or, with --install, to install all).
+        name: Option<String>,
+        /// Write SKILL.md into .agents/skills/<name>/ of this repository.
+        #[arg(long)]
+        install: bool,
     },
     /// Add `aliases.fork` to your jj config so `jj fork` runs this tool.
     Alias,
@@ -186,6 +195,9 @@ fn execute_inner(cli: Cli, reported: &mut bool) -> Result<i32> {
         return Ok(0);
     }
     let repo = Repo::discover(&cwd)?;
+    if let Command::Skill { name, install } = &cli.command {
+        return skill::run(&repo.root, name.as_deref(), *install);
+    }
     if let Command::Apply { file, push, report } = &cli.command {
         *reported = true; // Apply writes its own authenticated or initial-error report.
         return workflow::apply(&repo, file, cli.config.as_deref(), *push, report.as_deref());
@@ -194,19 +206,22 @@ fn execute_inner(cli: Cli, reported: &mut bool) -> Result<i32> {
         upstream: Some(url),
     } = &cli.command
         && cli.config.is_none()
-        && !repo.root.join(config::FILE_NAME).exists()
+        && !config::resolve_path(&repo.root, None).exists()
     {
         init::write_starter_config(&repo.root, url)?;
     }
     let config = Config::load(&repo.root, cli.config.as_deref())?;
+    if matches!(
+        cli.command,
+        Command::Check(_) | Command::Sync(_) | Command::Assemble { .. }
+    ) {
+        skill::warn_if_stale(&repo.root);
+    }
     if let Command::Repair { command } = cli.command {
         return repair::run(&repo, &config, command);
     }
-    let config_path = std::fs::canonicalize(
-        cli.config
-            .as_deref()
-            .unwrap_or(&repo.root.join(config::FILE_NAME)),
-    )?;
+    let config_path =
+        std::fs::canonicalize(config::resolve_path(&repo.root, cli.config.as_deref()))?;
     let options = |args: SyncArgs, candidate: Option<String>, command: &str| Options {
         context: workflow::Context {
             command: command.into(),
@@ -235,7 +250,7 @@ fn execute_inner(cli: Cli, reported: &mut bool) -> Result<i32> {
             init::init(&repo, &config)?;
             return Ok(0);
         }
-        Command::Alias => unreachable!(),
+        Command::Alias | Command::Skill { .. } => unreachable!(),
         Command::Check(args) => {
             anyhow::ensure!(
                 args.save_plan.is_none(),

@@ -80,6 +80,7 @@ pub fn init(repo: &Repo, config: &Config) -> Result<()> {
         progress("colocating jj with the Git checkout");
         run::output_all(root, "jj", &["git", "init", "--colocate"])?;
     }
+    crate::config::store_copy(root);
     let upstream = &config.upstream.remote;
     if repo.git(&["remote", "get-url", upstream]).is_err() {
         repo.git(&["remote", "add", upstream, &config.upstream.url])?;
