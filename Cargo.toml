@@ -1,6 +1,6 @@
 [package]
 name = "jj-fork"
-version = "0.2.6"
+version = "0.2.7"
 edition = "2024"
 rust-version = "1.89"
 description = "Maintain a fork as jj series and glues on top of upstream, and keep them current"

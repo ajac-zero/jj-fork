@@ -641,6 +641,11 @@ impl<'a> Session<'a> {
             native::set_bookmark(&mut self.tx, &name, &candidate);
             report(&format!("{name} -> {}", self.short_of(&candidate)));
         }
+        self.fast_forward_mirror()
+    }
+
+    /// Fast-forwards the mirror branch to the target when the target descends from it.
+    fn fast_forward_mirror(&mut self) -> Result<()> {
         if let Some(mirror) = self.config.fork.mirror_branch.clone()
             && let Some(current) = native::bookmark(self.tx.repo(), &mirror)?
             && current != self.target
@@ -1345,6 +1350,8 @@ pub fn rebuild_repaired(
             native::set_bookmark(&mut session.tx, &name, &tip);
         }
     }
+    // Like a clean sync, a repaired plan moves the mirror along with the rebased series.
+    session.fast_forward_mirror()?;
     let mut subjects = BTreeSet::new();
     let mut approved = original.proposal.approved_new_glues.clone();
     for replacement in replacements {

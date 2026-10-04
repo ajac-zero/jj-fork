@@ -147,6 +147,9 @@ change_ids() { jj --ignore-working-copy log --no-graph -r "$1" -T 'change_id.nor
 
 series_conflict() {
   fixture series-conflict
+  # A mirror branch must follow upstream after a repaired plan, as it does after a clean sync.
+  sed -i 's|^url = "\(.*\)"$|url = "\1"\n[fork]\nmirror_branch = "main"|' "$d/config.toml"
+  expect 20 invoke check --no-checks   # preparation creates the mirror bookmark
   save_plan
   jq -e '.payload.issues|any(.id=="series-conflict:patch/a")' "$d/plan.json" >/dev/null || fail 'no series-conflict issue'
   t="$d/task"
@@ -170,6 +173,7 @@ series_conflict() {
   equal "$(change_ids 'remote_bookmarks(exact:"main", exact:"upstream")..bookmarks(exact:"patch/a")' | sort)" "$expected_changes" 'series change ids changed'
   equal "$(git show "$(rev fork/main)":conflict.txt)" 'resolved' 'fork does not contain the resolution'
   equal "$(git log --format=%s -1 "$repaired")" 'a adds a' 'series tip metadata changed'
+  equal "$(rev main)" "$(git -C "$d/upstream.git" rev-parse main)" 'repaired plan did not fast-forward the mirror'
 }
 
 check_failure_and_batch() {
