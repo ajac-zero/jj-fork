@@ -53,19 +53,21 @@ jj fork apply /tmp/plan.json --push                                  # reruns ch
 
 Issue ids are in the plan: `.payload.issues[].id`, e.g. `series-conflict:patch/a`, `series-check:patch/b`, `glue-conflict:glue/a+b`, `glue-needed:glue/b+c`, `fork-conflict:…`, `fork-check:fork/main`.
 
+The owner (the clone that saved the plan) starts each task. A task is signed with that clone's private key, so `repair start` must run there, and `submit` from any other clone fails with `plan authentication failed ... MAC tag mismatch`.
+
 ```bash
 jj fork repair start /tmp/plan.json --issue series-conflict:patch/a --dir /tmp/task-a
 jj fork repair start /tmp/plan.json --issue series-check:patch/b --dir /tmp/task-b --allow-path path/in/b
 ```
 
-The task is its own Git+jj repository (no remotes, hooks, credentials, or plan key). Work only inside it:
+The task is its own Git+jj repository (no remotes, hooks, credentials, or plan key). The fixer works only inside it, in the owner's orb or on a copy:
 
 1. `jj -R DIR edit 'repair/result-'` (the first conflicted commit; check the start output), fix files, `jj -R DIR status` to snapshot. jj carries the resolution into descendants.
 2. Keep the series' commit count, order, change ids, and parents; do not squash, reorder, add parents, or rewrite descriptions.
 3. Change only the allowed paths (conflicted paths by default; check failures need `--allow-path`). Never touch `.jj-fork.toml`, `.git*`, or other metadata.
 4. Regenerate generated files rather than merging them by hand, if the repo's config names a `regenerate` command.
 
-Then, from the source repo:
+Fixers on another machine get the task as an archive: `tar -czf task.tgz -C /tmp task-a`. The fixer unpacks it, edits and snapshots as above, verifies, and returns the **whole directory** (`tar -czf result.tgz task-a`). A changed-files overlay is rejected ("repair/result is unchanged") because jj has not snapshotted it, and restoring only `.jj` over the old one leaves divergent operations. Unpack into a fresh empty directory (any path); then, from the source repo:
 
 ```bash
 jj fork repair submit /tmp/task-a /tmp/task-b --save-plan /tmp/next.json
@@ -79,8 +81,8 @@ Glue conflict after a restack: repair the `glue-conflict` issue (one authorized 
 ## Scheduled fork owner (low-mode router)
 
 1. `jj fork sync --save-plan P --report R`. Exit `0`: `jj fork apply P --push`, done.
-2. Exit `20`: for each issue in `R`, spawn one fixer thread (mode by tier) running the repair procedure above, all against the **same plan**; fixers return their task dirs.
-3. `jj fork repair submit <dirs> --save-plan N`, then `jj fork apply N --push`. Resolve any remaining glue issue the same way and repeat.
+2. Exit `20`: for each issue in `R`, the owner runs `jj fork repair start P --issue ID --dir DIR`, then gives a fixer the task (a directory in the owner's orb, or an archive) plus the issue id and allowed paths. Fixers never run `repair start` and never see the plan or push.
+3. Collect the returned tasks, `jj fork repair submit <dirs> --save-plan N`, then `jj fork apply N --push`. Resolve any remaining glue issue the same way and repeat.
 4. Fixers never publish, push, or touch `fork/main`, `main`, glues, or other series.
 
 ## Creating, editing, and retiring series

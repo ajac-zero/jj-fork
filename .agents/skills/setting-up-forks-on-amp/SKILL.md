@@ -38,7 +38,7 @@ Changing these affects every user of the project; get explicit approval first.
 
 ## Scheduled fork owner
 
-Create one thread schedule (building-schedules skill) that runs `jj fork sync --save-plan P --report R`. Exit 0: `jj fork apply P --push`. Exit 20: one fixer per issue in `R` runs `jj fork repair start` and `submit`, then `apply`. Fixer orbs are separate machines, so they must return their results to the owner (a branch or an artifact) or run inside the owner's orb. Do not give fixers push access to `fork/main`. Apply a saved plan right after saving it and in the same checkout: other jj operations make it stale. An end-to-end fixer-orb handoff is not provided by jj-fork; test yours before relying on it.
+Create one thread schedule (building-schedules skill) that runs `jj fork sync --save-plan P --report R`. Exit 0: `jj fork apply P --push`. Exit 20: for each issue in `R` the owner runs `jj fork repair start` in its own clone (tasks are signed with that clone's key, so a fixer cannot start or submit one) and gives one fixer the task directory, as an archive when the fixer runs in another orb. The fixer edits only inside it and returns the whole directory; the owner unpacks it and runs `submit`, then `apply`. Amp threads can share files with `thread_file_url` (large archives need a URL, not `upload_thread_file`; links expire after a few hours). Do not give fixers push access to `fork/main`. Apply a saved plan right after saving it and in the same checkout: other jj operations make it stale. Test your fixer handoff once before relying on it.
 
 ## Verify
 
