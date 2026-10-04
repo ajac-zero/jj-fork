@@ -268,6 +268,15 @@ stored_config_and_skills() {
   expect 0 "$bin" skill setting-up-forks-on-amp
   grep -q '^name: setting-up-forks-on-amp' "$d/out" || fail 'skill not printed'
   expect 1 "$bin" skill nonexistent
+  # A checkout with no file and no stored copy takes the committed file from a ref that has it.
+  git add .jj-fork.toml 2>/dev/null || true
+  cp "$d/config.toml" .jj-fork.toml
+  git add .jj-fork.toml; git commit -qm 'add config'; git push -q origin HEAD:refs/heads/fork/main
+  git fetch -q origin; git rm -q --cached .jj-fork.toml; rm -f .jj-fork.toml .jj/repo/jj-fork.toml
+  git commit -qm 'drop config'
+  expect 0 "$bin" check --no-checks --no-fetch
+  grep -q 'using the copy on' "$d/err" || fail 'config was not seeded from a ref'
+  cmp "$d/config.toml" .jj/repo/jj-fork.toml
   expect 0 "$bin" skill maintaining-forks-with-jj-fork --install
   cmp .agents/skills/maintaining-forks-with-jj-fork/SKILL.md <("$bin" skill maintaining-forks-with-jj-fork)
   printf 'old\n' >.agents/skills/maintaining-forks-with-jj-fork/SKILL.md

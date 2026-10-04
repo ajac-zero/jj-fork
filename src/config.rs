@@ -27,7 +27,54 @@ pub fn resolve_path(root: &Path, explicit: Option<&Path>) -> PathBuf {
     if tracked.exists() {
         store_copy(root);
     }
+    if !tracked.exists() && !stored.exists() {
+        seed_from_refs(root);
+    }
     if stored.exists() { stored } else { tracked }
+}
+
+/// A checkout without the committed file and without a stored copy (such as a series checkout in
+/// a new clone) takes the file from a ref that contains it, preferring the fork branch.
+fn seed_from_refs(root: &Path) {
+    if !root.join(".jj/repo").is_dir() {
+        return;
+    }
+    let Ok(refs) = crate::run::output(
+        root,
+        "git",
+        &[
+            "for-each-ref",
+            "--format=%(refname)",
+            "refs/remotes",
+            "refs/heads",
+        ],
+    ) else {
+        return;
+    };
+    let mut candidates: Vec<&str> = refs
+        .lines()
+        .filter(|r| {
+            crate::run::succeeds(
+                root,
+                "git",
+                &["cat-file", "-e", &format!("{r}:{FILE_NAME}")],
+            )
+            .unwrap_or(false)
+        })
+        .collect();
+    candidates.sort_by_key(|r| (!r.ends_with("/fork/main"), r.to_string()));
+    for r in candidates {
+        if let Ok(text) =
+            crate::run::output_all(root, "git", &["show", &format!("{r}:{FILE_NAME}")])
+        {
+            if std::fs::write(root.join(STORED), text).is_ok() {
+                crate::progress(&format!(
+                    "no {FILE_NAME} in this checkout; using the copy on {r}"
+                ));
+            }
+            return;
+        }
+    }
 }
 
 /// Best effort: a read-only repository directory only loses the fallback.
