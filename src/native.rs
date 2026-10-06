@@ -325,7 +325,11 @@ impl Native {
     /// Resolves a revision the way jj resolves `-r`, with the user's revset aliases, against
     /// the frozen repository. It must name exactly one commit.
     pub fn resolve_single(&self, expression: &str) -> Result<CommitId> {
-        let repo = self.repo.as_ref();
+        self.resolve_single_in(self.repo.as_ref(), expression)
+    }
+
+    /// Resolves against an observed repository without publishing or changing the frozen view.
+    pub fn resolve_single_in(&self, repo: &dyn JjRepo, expression: &str) -> Result<CommitId> {
         let context = self
             .env
             .revset_context(repo, self.workspace.workspace_name());

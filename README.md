@@ -60,6 +60,8 @@ Use `check --report FILE` to write a report, or `sync`/`assemble`/`retire --save
 
 Apply a saved plan with `jj fork apply PLAN [--push] [--report FILE]`. Apply authenticates the repository-local plan and its frozen preconditions, reruns the configured checks on the exact candidates, then compare-and-swap publishes only a successful candidate. Apply has no target, `--no-fetch`, or `--no-checks` override: the checked inputs cannot be silently changed at application time. Reports are informational, not executable instructions; plan and report formats are version-strict, and the tool never runs commands embedded in artifacts.
 
+Remote guards distinguish the fork from upstream: all fork refs must remain unchanged, but upstream guards only the resolved target (`main@upstream` by default, or the expression passed with `--target`). Unrelated upstream branches may be added, moved, or deleted without invalidating a plan or repair. If the target branch moves or disappears, prepare a new plan; an explicit commit-ID target stays pinned even if upstream's branches move.
+
 Write plans and reports outside the working tree, or in a path your Git excludes: an unignored artifact inside it is a new source file, so `apply` refuses the plan as stale. Plans are repository-local authenticated artifacts. Their HMAC authority is kept outside tracked files. Editing an artifact invalidates its authentication; plans are nonportable and become unusable when relevant inputs change or jj garbage-collects required objects. Missing objects are never silently reconstructed. Keep the repository's local authority and plan files private as appropriate; do not commit or share them as reusable portable plans.
 
 ## Isolated repair tasks

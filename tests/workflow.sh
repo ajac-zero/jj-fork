@@ -115,6 +115,12 @@ invalidation() {
     tracking) jj bookmark untrack --quiet patch/a --remote origin ;;
     settings) jj config set --repo snapshot.auto-track 'none()' ;;
     git) git update-ref refs/tags/concurrent "$(git rev-parse refs/heads/patch/a)" ;;
+    upstream)
+      printf 'next upstream\n' >"$d/upstream-src/next.txt"
+      git -C "$d/upstream-src" add .; git -C "$d/upstream-src" commit -qm next
+      git -C "$d/upstream-src" push -q "$d/upstream.git" main
+      ;;
+    upstream-delete) git -C "$d/upstream.git" update-ref -d refs/heads/main ;;
     remote|mirror)
       branch=patch/a; [[ $kind != mirror ]] || branch=main
       git -C "$d/fork-src" checkout -q "$branch"
@@ -131,6 +137,53 @@ invalidation() {
   if [[ $kind == source-untracked ]]; then equal "$(cat new-user-file)" 'unsnapshotted new file' 'stale plan discarded new source file'; fi
   if [[ $kind == op ]]; then [[ -n "$(rev user/concurrent)" ]] || fail 'concurrent bookmark lost'; fi
   jq -e '.payload.exit_code == 20 and .payload.published_operation == null' "$d/refused.json" >/dev/null
+  if [[ $kind == upstream* ]]; then
+    grep -q 'upstream target main@upstream' "$d/out" || fail 'refusal did not identify the upstream target'
+  fi
+  if [[ $kind == remote || $kind == mirror ]]; then
+    grep -q "origin changed since the plan froze ($branch)" "$d/out" || fail 'refusal did not identify the changed fork ref'
+  fi
+}
+
+unrelated_upstream_refs() {
+  fixture upstream-churn
+  target="$(git -C "$d/upstream.git" rev-parse main)"
+  old="$(git -C "$d/upstream.git" rev-parse main~1)"
+  git -C "$d/upstream.git" update-ref refs/heads/pr/move "$old"
+  git -C "$d/upstream.git" update-ref refs/heads/pr/delete "$target"
+  save
+  git -C "$d/upstream.git" update-ref refs/heads/pr/move "$target"
+  git -C "$d/upstream.git" update-ref -d refs/heads/pr/delete
+  git -C "$d/upstream.git" update-ref refs/heads/pr/new "$old"
+  expect 0 "$bin" apply "$d/plan.json" --push
+  equal "$(git -C "$d/fork.git" rev-parse main)" "$target" 'unrelated upstream churn blocked the mirror'
+  equal "$(git -C "$d/fork.git" rev-parse fork/main)" "$(rev fork/main)" 'fork candidate was not published'
+}
+
+custom_upstream_target() {
+  local kind="$1"
+  fixture "target-$kind"
+  target="$(git -C "$d/upstream.git" rev-parse main)"
+  old="$(git -C "$d/upstream.git" rev-parse main~1)"
+  git -C "$d/upstream.git" update-ref refs/heads/release "$target"
+  expression='release@upstream'
+  [[ $kind != pinned ]] || expression="$target"
+  expect 0 invoke sync --target "$expression" --save-plan "$d/plan.json"
+  before="$(refs)"; remote="$(remote_refs)"
+  case "$kind" in
+    moved) git -C "$d/upstream.git" update-ref refs/heads/release "$old" ;;
+    deleted) git -C "$d/upstream.git" update-ref -d refs/heads/release ;;
+    unchanged|pinned) git -C "$d/upstream.git" update-ref refs/heads/main "$old" ;;
+  esac
+  if [[ $kind == moved || $kind == deleted ]]; then
+    expect 20 "$bin" apply "$d/plan.json" --push
+    equal "$(refs)" "$before" 'custom-target drift published local work'
+    equal "$(remote_refs)" "$remote" 'custom-target drift pushed'
+    grep -q 'upstream target release@upstream' "$d/out" || fail 'custom target not named in refusal'
+  else
+    expect 0 "$bin" apply "$d/plan.json" --push
+    equal "$(git -C "$d/fork.git" rev-parse main)" "$target" 'custom target was silently changed'
+  fi
 }
 
 source_mutation_during_apply() {
@@ -362,7 +415,9 @@ run_case() {
 }
 run_case roundtrip roundtrip
 run_case authenticated-tampering tampering
-for kind in op source source-untracked config check-policy tracking settings git remote mirror; do run_case "invalidate-$kind" invalidation "$kind"; done
+for kind in op source source-untracked config check-policy tracking settings git remote mirror upstream upstream-delete; do run_case "invalidate-$kind" invalidation "$kind"; done
+run_case unrelated-upstream-refs unrelated_upstream_refs
+for kind in unchanged moved deleted pinned; do run_case "custom-upstream-target-$kind" custom_upstream_target "$kind"; done
 run_case source-mutating-apply-check source_mutation_during_apply
 run_case historical-pass-rerun rerun_failure
 run_case not-ready not_ready

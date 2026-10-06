@@ -448,7 +448,7 @@ impl<'a> Session<'a> {
                     Config::load(&self.repo.root, Some(&self.options.context.config_path))?;
                 self.frozen
                     .revalidate(self.repo, &mut fresh, &config, &self.options.context)?;
-                workflow::probe_remotes(&fresh, &config, &self.frozen.view)
+                workflow::probe_remotes(&fresh, &config, &self.frozen, &self.options.context)
             })();
             if let Err(error) = validation {
                 self.outcome = PlanOutcome::Refused;
@@ -1502,7 +1502,7 @@ pub fn rebuild_repaired(
     original
         .frozen
         .revalidate(repo, &mut fresh, config, &original.context)?;
-    workflow::probe_remotes(&fresh, config, &original.frozen.view)?;
+    workflow::probe_remotes(&fresh, config, &original.frozen, &original.context)?;
     session.capture_proposal()?;
     let mut proposal = session.proposal.take().unwrap();
     proposal.approved_new_glues = approved;

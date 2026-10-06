@@ -150,13 +150,22 @@ series_conflict() {
   # A mirror branch must follow upstream after a repaired plan, as it does after a clean sync.
   sed -i 's|^url = "\(.*\)"$|url = "\1"\n[fork]\nmirror_branch = "main"|' "$d/config.toml"
   expect 20 invoke check --no-checks   # preparation creates the mirror bookmark
+  target="$(git -C "$d/upstream.git" rev-parse main)"
+  old="$(git -C "$d/upstream.git" rev-parse main~1)"
+  git -C "$d/upstream.git" update-ref refs/heads/pr/move "$old"
+  git -C "$d/upstream.git" update-ref refs/heads/pr/delete "$target"
   save_plan
   jq -e '.payload.issues|any(.id=="series-conflict:patch/a")' "$d/plan.json" >/dev/null || fail 'no series-conflict issue'
+  # Unrelated upstream branches can appear, move, and disappear throughout a long repair.
+  git -C "$d/upstream.git" update-ref refs/heads/pr/move "$target"
+  git -C "$d/upstream.git" update-ref -d refs/heads/pr/delete
+  git -C "$d/upstream.git" update-ref refs/heads/pr/new "$old"
   t="$d/task"
   series_task "$t"
   contains "$d/out" 'conflicted: conflict.txt' 'start did not report the conflict'
   contains "$d/out" 'may change: conflict.txt' 'conflict scope is not the conflicted path'
   resolve_series "$t"
+  git -C "$d/upstream.git" update-ref refs/heads/pr/move "$old"
   submit 0 "$t" --save-plan "$d/next.json" --report "$d/next-report.json"
   jq -e '.kind=="jj-fork-plan" and .payload.outcome=="ready"' "$d/next.json" >/dev/null || fail 'successor not ready'
   jq -e '.kind=="jj-fork-report" and .payload.exit_code==0' "$d/next-report.json" >/dev/null || fail 'no report'
@@ -168,6 +177,7 @@ series_conflict() {
     || fail 'repaired candidate visible in the source before apply'
   copies="$(jq -r '.payload.proposal.mappings[]|select(.subject=="patch/a")|.copy' "$d/plan.json")"
   expected_changes="$(for c in $copies; do jq -r --arg c "$c" '.payload.proposal.candidates[]|select(.commit==$c)|.change' "$d/plan.json"; done | sort)"
+  git -C "$d/upstream.git" update-ref refs/heads/pr/move "$target"
   expect 0 "$bin" apply "$d/next.json"
   equal "$(rev patch/a)" "$repaired" 'apply did not publish the exact repaired series'
   equal "$(change_ids 'remote_bookmarks(exact:"main", exact:"upstream")..bookmarks(exact:"patch/a")' | sort)" "$expected_changes" 'series change ids changed'

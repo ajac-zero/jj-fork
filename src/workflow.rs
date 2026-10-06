@@ -668,7 +668,7 @@ fn apply_authenticated(
                    plan: &mut Plan|
      -> Result<(i32, Option<String>, Option<native::PushReport>)> {
         plan.frozen.revalidate(repo, jj, &config, &plan.context)?;
-        probe_remotes(jj, &config, &plan.frozen.view)?;
+        probe_remotes(jj, &config, &plan.frozen, &plan.context)?;
         let op = OperationId::try_from_hex(
             plan.proposal
                 .operation
@@ -756,7 +756,7 @@ fn apply_authenticated(
             policy_fingerprint(&fresh, &current_config)? == plan.frozen.policy_fingerprint,
             "check policy changed during apply"
         );
-        probe_remotes(&fresh, &config, &plan.frozen.view)?;
+        probe_remotes(&fresh, &config, &plan.frozen, &plan.context)?;
         if let Some(path) = report_path {
             artifact::save_report(
                 path,
@@ -846,19 +846,52 @@ fn apply_authenticated(
     Ok(code)
 }
 
-pub fn probe_remotes(jj: &Native, config: &Config, frozen: &ViewState) -> Result<()> {
+/// The fork's refs guard publication; upstream only supplies the resolved target. Changes to
+/// unrelated upstream branches must not invalidate hours of checks or an isolated repair.
+pub fn probe_remotes(
+    jj: &Native,
+    config: &Config,
+    frozen: &FrozenInputs,
+    context: &Context,
+) -> Result<()> {
     for remote in BTreeSet::from([&config.fork.remote, &config.upstream.remote]) {
         let observed = jj.probe_remote(remote)?;
-        let current = ViewState::capture(observed.as_ref());
-        let relevant = |r: &&RemoteRef| r.remote == *remote;
-        ensure!(
-            frozen
-                .remotes
-                .iter()
-                .filter(relevant)
-                .eq(current.remotes.iter().filter(relevant)),
-            "{remote} changed since the plan froze; nothing published or pushed"
-        );
+        if remote == &config.fork.remote {
+            let current = ViewState::capture(observed.as_ref());
+            let refs = |view: &ViewState| -> BTreeMap<_, _> {
+                view.remotes
+                    .iter()
+                    .filter(|r| r.remote == *remote)
+                    .map(|r| ((r.tag, r.name.clone()), r.clone()))
+                    .collect()
+            };
+            let before = refs(&frozen.view);
+            let after = refs(&current);
+            let changed: BTreeSet<_> = before
+                .keys()
+                .chain(after.keys())
+                .filter(|key| before.get(*key) != after.get(*key))
+                .map(|(tag, name)| format!("{}{name}", if *tag { "tag:" } else { "" }))
+                .collect();
+            ensure!(
+                changed.is_empty(),
+                "{remote} changed since the plan froze ({}); nothing published or pushed",
+                changed.into_iter().collect::<Vec<_>>().join(", ")
+            );
+        }
+        if remote == &config.upstream.remote {
+            let default = config.upstream_ref();
+            let expression = context.target_expression.as_deref().unwrap_or(&default);
+            let target = jj.resolve_single_in(observed.as_ref(), expression).with_context(|| {
+                format!("upstream target {expression} is no longer resolvable; nothing published or pushed")
+            })?;
+            ensure!(
+                target.hex() == frozen.target,
+                "upstream target {expression} changed since the plan froze ({} -> {}); nothing published or pushed",
+                frozen.target,
+                target.hex()
+            );
+        }
     }
     Ok(())
 }
@@ -870,7 +903,7 @@ pub fn load_proposal(repo: &Repo, config: &Config, plan: &Plan) -> Result<Arc<Re
     let mut jj = Native::load(&repo.root)?;
     plan.frozen
         .revalidate(repo, &mut jj, config, &plan.context)?;
-    probe_remotes(&jj, config, &plan.frozen.view)?;
+    probe_remotes(&jj, config, &plan.frozen, &plan.context)?;
     let op = OperationId::try_from_hex(
         plan.proposal
             .operation
